@@ -1,6 +1,9 @@
 package lru
 
-import "container/list"
+import (
+	"container/list"
+	"time"
+)
 
 type Cache struct {
 	maxBytes  int64
@@ -15,8 +18,9 @@ type Value interface {
 }
 
 type entry struct {
-	key   string
-	value Value
+	key      string
+	value    Value
+	expireAt time.Time
 }
 
 func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
@@ -30,8 +34,13 @@ func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
 
 func (c *Cache) Get(key string) (value Value, ok bool) {
 	if ele, ok := c.cache[key]; ok {
-		c.ll.MoveToFront(ele)
 		kv := ele.Value.(*entry)
+		if !kv.expireAt.IsZero() && time.Now().After(kv.expireAt) {
+			c.Remove(key)
+			return nil, false
+		}
+		c.ll.MoveToFront(ele)
+
 		return kv.value, true
 	}
 	return
@@ -51,18 +60,35 @@ func (c *Cache) RemoveOldest() {
 }
 
 func (c *Cache) Add(key string, value Value) {
+	c.AddWithTTL(key, value, 0)
+}
+
+func (c *Cache) AddWithTTL(key string, value Value, ttl time.Duration) {
 	if ele, ok := c.cache[key]; ok {
 		c.ll.MoveToFront(ele)
 		kv := ele.Value.(*entry)
 		c.curbytes += int64(value.Len()) - int64(kv.value.Len())
 		kv.value = value
+		kv.expireAt = time.Now().Add(ttl)
 	} else {
-		ele := c.ll.PushFront(&entry{key, value})
+		ele := c.ll.PushFront(&entry{key, value, time.Now().Add(ttl)})
 		c.cache[key] = ele
 		c.curbytes += int64(len(key)) + int64(value.Len())
 	}
 	for c.maxBytes != 0 && c.curbytes > c.maxBytes {
 		c.RemoveOldest()
+	}
+}
+
+func (c *Cache) Remove(key string) {
+	if ele, ok := c.cache[key]; ok {
+		c.ll.Remove(ele)
+		kv := ele.Value.(*entry)
+		delete(c.cache, key)
+		c.curbytes -= int64(len(kv.key)) + int64(kv.value.Len())
+		if c.onEvicted != nil {
+			c.onEvicted(kv.key, kv.value)
+		}
 	}
 }
 
