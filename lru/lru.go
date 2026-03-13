@@ -69,7 +69,11 @@ func (c *Cache) AddWithTTL(key string, value Value, ttl time.Duration) {
 		kv := ele.Value.(*entry)
 		c.curbytes += int64(value.Len()) - int64(kv.value.Len())
 		kv.value = value
-		kv.expireAt = time.Now().Add(ttl)
+		if ttl > 0 {
+			kv.expireAt = time.Now().Add(ttl)
+		} else {
+			kv.expireAt = time.Time{}
+		}
 	} else {
 		ele := c.ll.PushFront(&entry{key, value, time.Now().Add(ttl)})
 		c.cache[key] = ele
@@ -89,6 +93,17 @@ func (c *Cache) Remove(key string) {
 		if c.onEvicted != nil {
 			c.onEvicted(kv.key, kv.value)
 		}
+	}
+}
+
+func (c *Cache) RemoveExpired() {
+	for ele := c.ll.Back(); ele != nil; {
+		prev := ele.Prev()
+		kv := ele.Value.(*entry)
+		if !kv.expireAt.IsZero() && time.Now().After(kv.expireAt) {
+			c.Remove(kv.key)
+		}
+		ele = prev
 	}
 }
 

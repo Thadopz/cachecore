@@ -15,6 +15,7 @@ type MetricsSnapshot struct {
 	PeerLoads        uint64
 	LocalLoads       uint64
 	PeerHTTPRequests uint64
+	FilterMisses     uint64
 }
 
 type Metrics struct {
@@ -26,6 +27,7 @@ type Metrics struct {
 	PeerLoads        uint64
 	LocalLoads       uint64
 	PeerHTTPRequests uint64
+	FilterMisses     uint64
 }
 
 var Stats = &Metrics{}
@@ -37,6 +39,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		GroupGets:        atomic.LoadUint64(&m.GroupGets),
 		CacheHits:        atomic.LoadUint64(&m.CacheHits),
 		CacheMisses:      atomic.LoadUint64(&m.CacheMisses),
+		FilterMisses:     atomic.LoadUint64(&m.FilterMisses),
 		PeerLoads:        atomic.LoadUint64(&m.PeerLoads),
 		LocalLoads:       atomic.LoadUint64(&m.LocalLoads),
 		PeerHTTPRequests: atomic.LoadUint64(&m.PeerHTTPRequests),
@@ -73,6 +76,10 @@ func (m *Metrics) IncLocalLoads() {
 
 func (m *Metrics) IncPeerHTTPRequests() {
 	atomic.AddUint64(&m.PeerHTTPRequests, 1)
+}
+
+func (m *Metrics) IncFilterMisses() {
+	atomic.AddUint64(&m.FilterMisses, 1)
 }
 
 func (m *Metrics) StartLogger(interval time.Duration) {
