@@ -48,22 +48,8 @@ var (
 )
 
 type Options struct {
-	CacheBytes int64
-	Getter     Getter
-	Filter     Filter
-	Janitor    *Janitor
-}
-
-func WithCacheBytes(cacheBytes int64) Option {
-	return func(o *Options) {
-		o.CacheBytes = cacheBytes
-	}
-}
-
-func WithGetter(getter Getter) Option {
-	return func(o *Options) {
-		o.Getter = getter
-	}
+	Filter  Filter
+	Janitor *Janitor
 }
 
 func WithFilter(filter Filter) Option {
@@ -82,26 +68,19 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 	if getter == nil {
 		panic("nil Getter")
 	}
-
-	options := &Options{
-		CacheBytes: cacheBytes,
-		Getter:     getter,
-	}
+	options := &Options{}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(options)
 		}
-	}
-	if options.Getter == nil {
-		panic("nil Getter")
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
 		name:      name,
-		getter:    options.Getter,
-		mainCache: cache{cacheBytes: options.CacheBytes},
+		getter:    getter,
+		mainCache: cache{cacheBytes: cacheBytes},
 		loader:    &singleflight.Group{},
 		filter:    options.Filter,
 		janitor:   options.Janitor,
