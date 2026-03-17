@@ -26,19 +26,19 @@ func createGroup() *groupcache.Group {
 		}))
 }
 
-func startCacheServer(addr string, addrs []string, gee *groupcache.Group) {
+func startCacheServer(addr string, addrs []string, gcache *groupcache.Group) {
 	peers := groupcache.NewHTTPPool(addr)
 	peers.Set(addrs...)
-	gee.RegisterPeers(peers)
-	log.Println("geecache is running at", addr)
+	gcache.RegisterPeers(peers)
+	log.Println("cache is running at", addr)
 	log.Fatal(http.ListenAndServe(addr[7:], peers))
 }
 
-func startAPIServer(apiAddr string, gee *groupcache.Group) {
+func startAPIServer(apiAddr string, gcache *groupcache.Group) {
 	http.Handle("/api", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			key := r.URL.Query().Get("key")
-			view, err := gee.Get(key)
+			view, err := gcache.Get(key)
 			groupcache.Stats.IncAPIRequests()
 			if err != nil {
 				groupcache.Stats.IncAPIErrors()
@@ -49,7 +49,7 @@ func startAPIServer(apiAddr string, gee *groupcache.Group) {
 			w.Write(view.ByteSlice())
 
 		}))
-	log.Println("fontend server is running at", apiAddr)
+	log.Println("frontend server is running at", apiAddr)
 	log.Fatal(http.ListenAndServe(apiAddr[7:], nil))
 
 }
@@ -73,10 +73,10 @@ func main() {
 		addrs = append(addrs, v)
 	}
 
-	gee := createGroup()
+	requestGroup := createGroup()
 	if api {
-		go startAPIServer(apiAddr, gee)
+		go startAPIServer(apiAddr, requestGroup)
 	}
 	go groupcache.Stats.StartLogger(time.Second * 5)
-	startCacheServer(addrMap[port], []string(addrs), gee)
+	startCacheServer(addrMap[port], []string(addrs), requestGroup)
 }

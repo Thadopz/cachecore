@@ -10,6 +10,8 @@ message Request {
 
 message Response {
   bytes value = 1;
+  int32 code = 2;
+  string errMsg = 3;
 }
 
 service GroupCache {
