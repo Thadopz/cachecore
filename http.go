@@ -63,53 +63,58 @@ func (p *HTTPPool) Log(format string, v ...interface{}) {
 	log.Printf("[Server %s] %s", p.self, fmt.Sprintf(format, v...))
 }
 
-func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	Stats.IncPeerHTTPRequests()
-	if r.URL.Path != defaultRPCPath {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
+func writeProtoResponse(w http.ResponseWriter, code int32, errMsg string, value []byte) {
+	resp := &pb.Response{
+		Code:   code,
+		ErrMsg: errMsg,
+		Value:  value,
 	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req pb.Request
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body failed", http.StatusBadRequest)
-		return
-	}
-	if err := proto.Unmarshal(body, &req); err != nil {
-		http.Error(w, "failed to unmarshal request", http.StatusBadRequest)
-		return
-	}
-
-	resp := &pb.Response{}
-	group := GetGroup(req.GetGroup())
-	if group == nil {
-		resp.Code = http.StatusNotFound
-		resp.ErrMsg = fmt.Sprintf("group %s not found", req.GetGroup())
-		return
-	} else {
-		view, err := group.Get(req.GetKey())
-		if err != nil {
-			resp.Code = http.StatusInternalServerError
-			resp.ErrMsg = err.Error()
-		} else {
-			resp.Code = http.StatusOK
-			resp.Value = view.ByteSlice()
-		}
-	}
-
-	out, err := proto.Marshal(resp)
+	data, err := proto.Marshal(resp)
 	if err != nil {
 		http.Error(w, "failed to marshal response", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.WriteHeader(http.StatusOK)
-	w.Write(out)
+	_, _ = w.Write(data)
+}
+
+func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	Stats.IncPeerHTTPRequests()
+	if r.URL.Path != defaultRPCPath {
+		writeProtoResponse(w, http.StatusBadRequest, "bad request path", nil)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeProtoResponse(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+
+	var req pb.Request
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeProtoResponse(w, http.StatusBadRequest, "read body failed", nil)
+		return
+	}
+	if err := proto.Unmarshal(body, &req); err != nil {
+		writeProtoResponse(w, http.StatusBadRequest, "failed to unmarshal request", nil)
+		return
+	}
+
+	group := GetGroup(req.GetGroup())
+	if group == nil {
+		writeProtoResponse(w, http.StatusNotFound, fmt.Sprintf("group %s not found", req.GetGroup()), nil)
+		return
+	} else {
+		view, err := group.Get(req.GetKey())
+		if err != nil {
+			writeProtoResponse(w, http.StatusInternalServerError, err.Error(), nil)
+			return
+		} else {
+			writeProtoResponse(w, 0, "", view.ByteSlice())
+			return
+		}
+	}
 }
 
 type httpGetter struct {
@@ -124,10 +129,10 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 
 	endpoint := h.baseURL + "get"
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(reqBody))
-	req.Header.Set("Content-Type", "application/x-protobuf")
 	if err != nil {
 		return fmt.Errorf("failed to create request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -146,8 +151,8 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	if err = proto.Unmarshal(respBody, out); err != nil {
 		return fmt.Errorf("decoding response body: %v", err)
 	}
-	if out.GetCode() != http.StatusOK {
-		return fmt.Errorf("server error: %s", out.GetErrMsg())
+	if out.GetCode() != 0 {
+		return fmt.Errorf("server error code=%d: %s", out.GetCode(), out.GetErrMsg())
 	}
 	return nil
 }

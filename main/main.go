@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	groupcache "goCache"
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 var db = map[string]string{
@@ -16,10 +21,27 @@ var db = map[string]string{
 }
 
 func createGroup() *groupcache.Group {
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Printf("[Redis] ping failed, fallback to db only: %v", err)
+	}
+
 	return groupcache.NewGroup("scores", 2<<10, groupcache.GetterFunc(
 		func(key string) ([]byte, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+
+			if value, err := rdb.Get(ctx, key).Result(); err == nil {
+				return []byte(value), nil
+			} else if !errors.Is(err, redis.Nil) {
+				log.Printf("[Redis] GET failed for key=%s: %v", key, err)
+			}
+
 			log.Println("[SlowDB] search key", key)
 			if v, ok := db[key]; ok {
+				if err := rdb.Set(ctx, key, v, 0).Err(); err != nil {
+					log.Printf("[Redis] SET failed for key=%s: %v", key, err)
+				}
 				return []byte(v), nil
 			}
 			return nil, fmt.Errorf("%s not exist", key)
@@ -49,6 +71,44 @@ func startAPIServer(apiAddr string, gcache *groupcache.Group) {
 			w.Write(view.ByteSlice())
 
 		}))
+	http.Handle("/debug/stats", http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			snapshot := groupcache.Stats.Snapshot()
+
+			hitRate := 0.0
+			if snapshot.GroupGets > 0 {
+				hitRate = float64(snapshot.CacheHits) / float64(snapshot.GroupGets) * 100
+			}
+
+			errorRate := 0.0
+			if snapshot.APIRequests > 0 {
+				errorRate = float64(snapshot.APIErrors) / float64(snapshot.APIRequests) * 100
+			}
+
+			payload := map[string]any{
+				"timestamp": time.Now().Format(time.RFC3339),
+				"totals": map[string]uint64{
+					"api_requests":       snapshot.APIRequests,
+					"api_errors":         snapshot.APIErrors,
+					"group_gets":         snapshot.GroupGets,
+					"cache_hits":         snapshot.CacheHits,
+					"cache_misses":       snapshot.CacheMisses,
+					"peer_loads":         snapshot.PeerLoads,
+					"local_loads":        snapshot.LocalLoads,
+					"peer_http_requests": snapshot.PeerHTTPRequests,
+					"filter_misses":      snapshot.FilterMisses,
+				},
+				"rates": map[string]float64{
+					"hit_rate_percent":   hitRate,
+					"error_rate_percent": errorRate,
+				},
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(payload); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+		}))
 	log.Println("frontend server is running at", apiAddr)
 	log.Fatal(http.ListenAndServe(apiAddr[7:], nil))
 
@@ -61,7 +121,7 @@ func main() {
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.Parse()
 
-	apiAddr := "http://localhost:9999"
+	apiAddr := "http://0.0.0.0:9999"
 	addrMap := map[int]string{
 		8001: "http://localhost:8001",
 		8002: "http://localhost:8002",
