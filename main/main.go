@@ -7,8 +7,10 @@ import (
 	"flag"
 	"fmt"
 	groupcache "goCache"
+	"goCache/bloomfilter"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -18,6 +20,31 @@ var db = map[string]string{
 	"Tom":  "630",
 	"Jack": "589",
 	"Sam":  "567",
+}
+
+func seedRedisNumericKeys() {
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	defer rdb.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Printf("[Redis] skip seed, ping failed: %v", err)
+		return
+	}
+
+	pipe := rdb.Pipeline()
+	for i := 0; i <= 100; i++ {
+		v := strconv.Itoa(i)
+		pipe.Set(ctx, "key"+v, v, 0)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("[Redis] seed failed: %v", err)
+		return
+	}
+
+	log.Printf("[Redis] seeded key0~key100")
 }
 
 func createGroup() *groupcache.Group {
@@ -45,7 +72,14 @@ func createGroup() *groupcache.Group {
 				return []byte(v), nil
 			}
 			return nil, fmt.Errorf("%s not exist", key)
-		}))
+		}),
+		groupcache.WithFilter(bloomfilter.New(1000, 6)),
+		//groupcache.WithJanitor(time.Minute),
+		groupcache.WithOnEvicted(func(key string, value groupcache.ByteView) {
+			log.Printf("[Cache] evicted key=%s", key)
+		}),
+		//groupcache.WithShardedCache(10),
+	)
 }
 
 func startCacheServer(addr string, addrs []string, gcache *groupcache.Group) {
@@ -133,7 +167,10 @@ func main() {
 		addrs = append(addrs, v)
 	}
 
+	seedRedisNumericKeys()
+
 	requestGroup := createGroup()
+	requestGroup.Warmup([]string{"Tom"})
 	if api {
 		go startAPIServer(apiAddr, requestGroup)
 	}

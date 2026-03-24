@@ -39,8 +39,9 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 			c.Remove(key)
 			return nil, false
 		}
-		c.ll.MoveToFront(ele)
-
+		if ele != c.ll.Front() {
+			c.ll.MoveToFront(ele)
+		}
 		return kv.value, true
 	}
 	return
@@ -75,7 +76,11 @@ func (c *Cache) AddWithTTL(key string, value Value, ttl time.Duration) {
 			kv.expireAt = time.Time{}
 		}
 	} else {
-		ele := c.ll.PushFront(&entry{key, value, time.Now().Add(ttl)})
+		expireAt := time.Time{}
+		if ttl > 0 {
+			expireAt = time.Now().Add(ttl)
+		}
+		ele := c.ll.PushFront(&entry{key: key, value: value, expireAt: expireAt})
 		c.cache[key] = ele
 		c.curbytes += int64(len(key)) + int64(value.Len())
 	}

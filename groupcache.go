@@ -23,19 +23,47 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 }
 
 type Group struct {
-	name        string
-	getter      Getter
-	mainCache   cache
-	peers       PeerPicker
-	loader      *singleflight.Group
+	// name is the name of this group, must be unique and non-empty
+	name string
+
+	// getter is called when a key is not found in the cache.
+	// It should return the data corresponding to the key.
+	getter Getter
+
+	// mainCache is the cache that holds the key-value pairs.
+	// It is protected by a mutex to ensure thread safety.
+	mainCache Cache
+
+	// peers is used to pick a peer to get the value for a key.
+	// It is set by RegisterPeers and should not be nil after that.
+	peers PeerPicker
+
+	// loader is used to ensure that each key is only fetched once
+	// even if there are concurrent requests for the same key.
+	loader *singleflight.Group
+
+	// filter is used to track which keys are present in the cache,
+	// to avoid unnecessary calls to the getter.
+	// it is optional and can be nil if not needed.
 	filter      Filter
-	janitor     *Janitor
 	filterReady atomic.Bool
+
+	// janitor is used to periodically clean up expired items from the cache.
+	// it is optional and can be nil if not needed.
+	janitor *Janitor
 }
 
 type Filter interface {
+	// Add adds an item to the filter.
 	Add(item string)
+
+	// Contains checks if an item is in the filter.
+	// It should return true if the item is probably in the filter,
+	// and false if it is definitely not in the filter.
 	Contains(item string) bool
+
+	// Remove removes an item from the filter.
+	// It should ensure that the item is no longer considered to be in the filter.
 	Remove(item string)
 }
 
@@ -48,19 +76,48 @@ var (
 )
 
 type Options struct {
-	Filter  Filter
-	Janitor *Janitor
+	Filter    Filter
+	Janitor   *Janitor
+	onEvicted func(key string, value ByteView)
+	cache     Cache
+	useShards bool
+	shards    uint32
 }
 
 func WithFilter(filter Filter) Option {
+	// WithFilter returns an Option that sets the filter for a Group.
 	return func(o *Options) {
 		o.Filter = filter
 	}
 }
 
 func WithJanitor(interval time.Duration) Option {
+	// WithJanitor returns an Option that sets the janitor for a Group.
 	return func(o *Options) {
 		o.Janitor = NewJanitor(interval)
+	}
+}
+
+func WithOnEvicted(onEvicted func(key string, value ByteView)) Option {
+	// WithOnEvicted returns an Option that sets the onEvicted callback for a Group's cache.
+	return func(o *Options) {
+		o.onEvicted = onEvicted
+	}
+}
+
+func WithCache(cache Cache) Option {
+	// WithCache injects a custom cache implementation.
+	// It takes precedence over WithShardedCache.
+	return func(o *Options) {
+		o.cache = cache
+	}
+}
+
+func WithShardedCache(shards uint32) Option {
+	// WithShardedCache enables sharded cache initialization in NewGroup.
+	return func(o *Options) {
+		o.useShards = true
+		o.shards = shards
 	}
 }
 
@@ -75,12 +132,29 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		}
 	}
 
+	mainCache := options.cache
+	if mainCache == nil {
+		if options.useShards {
+			shards := options.shards
+			if shards == 0 {
+				shards = 256
+			}
+			perShardBytes := cacheBytes / int64(shards)
+			if perShardBytes <= 0 {
+				perShardBytes = 1
+			}
+			mainCache = newShardedCache(0, shards, perShardBytes, options.onEvicted)
+		} else {
+			mainCache = &cache{cacheBytes: cacheBytes, onEvicted: options.onEvicted}
+		}
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
 		name:      name,
 		getter:    getter,
-		mainCache: cache{cacheBytes: cacheBytes},
+		mainCache: mainCache,
 		loader:    &singleflight.Group{},
 		filter:    options.Filter,
 		janitor:   options.Janitor,
