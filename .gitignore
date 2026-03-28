@@ -1,0 +1,6 @@
+perf/test-logs/k6/*.log
+perf/test-logs/k6/*.json
+perf/test-logs/pprof/*.pb.gz
+test-logs/pprof/*.pb.gz
+test-logs/*.log
+.vscode/*.json

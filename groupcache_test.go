@@ -153,3 +153,73 @@ func TestWarmupKeepsNotReadyOnFailure(t *testing.T) {
 		t.Fatalf("filter should remain not ready when warmup has failures")
 	}
 }
+
+func TestGroupWithRandomTTLExpiresEntry(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-random-ttl-expire", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("v"), nil
+	}), WithRandomTTL(40*time.Millisecond, 0))
+
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("getter call count after first get: got %d, want 1", got)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("second get failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("getter should be called again after ttl expires: got %d, want 2", got)
+	}
+}
+
+func TestGroupWithRandomTTLSamplesWithinRange(t *testing.T) {
+	g := NewGroup("test-random-ttl-range", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+		return []byte("v"), nil
+	}), WithRandomTTL(100*time.Millisecond, 30*time.Millisecond))
+
+	minTTL := 70 * time.Millisecond
+	maxTTL := 130 * time.Millisecond
+
+	for i := 0; i < 300; i++ {
+		ttl := g.nextTTL()
+		if ttl < minTTL || ttl > maxTTL {
+			t.Fatalf("ttl out of expected range: got %s, want [%s, %s]", ttl, minTTL, maxTTL)
+		}
+	}
+}
+
+func TestInvalidateRemovesMainCacheEntry(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-invalidate-main-cache", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("value"), nil
+	}))
+
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("getter call count after first get: got %d, want 1", got)
+	}
+
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("second get failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("second get should hit cache: got %d, want 1", got)
+	}
+
+	g.Invalidate("Tom")
+
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("third get failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("getter should be called again after invalidate: got %d, want 2", got)
+	}
+}

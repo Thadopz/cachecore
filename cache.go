@@ -11,6 +11,7 @@ type Cache interface {
 	add(key string, value ByteView)
 	addWithTTL(key string, value ByteView, ttl time.Duration)
 	get(key string) (value ByteView, ok bool)
+	remove(key string)
 	clearupExpired()
 }
 
@@ -59,6 +60,15 @@ func (c *cache) get(key string) (value ByteView, ok bool) {
 		return v.(ByteView), true
 	}
 	return
+}
+
+func (c *cache) remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru == nil {
+		return
+	}
+	c.lru.Remove(key)
 }
 
 func (c *cache) clearupExpired() {

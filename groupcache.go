@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"goCache/singleflight"
 	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,13 @@ type Group struct {
 	// janitor is used to periodically clean up expired items from the cache.
 	// it is optional and can be nil if not needed.
 	janitor *Janitor
+
+	// cacheTTL is the base TTL for cached values. 0 means no expiration.
+	cacheTTL time.Duration
+
+	// cacheTTLJitter adds random jitter in range [-cacheTTLJitter, +cacheTTLJitter]
+	// to avoid synchronized expirations.
+	cacheTTLJitter time.Duration
 }
 
 type Filter interface {
@@ -82,6 +90,8 @@ type Options struct {
 	cache     Cache
 	useShards bool
 	shards    uint32
+	cacheTTL  time.Duration
+	ttlJitter time.Duration
 }
 
 func WithFilter(filter Filter) Option {
@@ -121,6 +131,23 @@ func WithShardedCache(shards uint32) Option {
 	}
 }
 
+func WithRandomTTL(baseTTL, jitter time.Duration) Option {
+	// WithRandomTTL sets a base TTL and random jitter for cache entries.
+	// Effective TTL will be baseTTL + random(-jitter, +jitter), and will be clamped to > 0.
+	return func(o *Options) {
+		if baseTTL <= 0 {
+			o.cacheTTL = 0
+			o.ttlJitter = 0
+			return
+		}
+		if jitter < 0 {
+			jitter = -jitter
+		}
+		o.cacheTTL = baseTTL
+		o.ttlJitter = jitter
+	}
+}
+
 func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Group {
 	if getter == nil {
 		panic("nil Getter")
@@ -152,12 +179,14 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
-		name:      name,
-		getter:    getter,
-		mainCache: mainCache,
-		loader:    &singleflight.Group{},
-		filter:    options.Filter,
-		janitor:   options.Janitor,
+		name:           name,
+		getter:         getter,
+		mainCache:      mainCache,
+		loader:         &singleflight.Group{},
+		filter:         options.Filter,
+		janitor:        options.Janitor,
+		cacheTTL:       options.cacheTTL,
+		cacheTTLJitter: options.ttlJitter,
 	}
 	if g.janitor != nil {
 		go g.janitor.Run(g)
@@ -243,11 +272,33 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	}
 	Stats.IncLocalLoads()
 	value := ByteView{b: cloneBytes(bytes)}
-	g.mainCache.add(key, value)
+	ttl := g.nextTTL()
+	if ttl > 0 {
+		g.mainCache.addWithTTL(key, value, ttl)
+	} else {
+		g.mainCache.add(key, value)
+	}
 	if g.filter != nil {
 		g.filter.Add(key)
 	}
 	return value, nil
+}
+
+func (g *Group) nextTTL() time.Duration {
+	if g.cacheTTL <= 0 {
+		return 0
+	}
+	if g.cacheTTLJitter <= 0 {
+		return g.cacheTTL
+	}
+
+	rangeN := int64(g.cacheTTLJitter)*2 + 1
+	delta := time.Duration(rand.Int63n(rangeN)) - g.cacheTTLJitter
+	ttl := g.cacheTTL + delta
+	if ttl <= 0 {
+		return time.Nanosecond
+	}
+	return ttl
 }
 
 func (g *Group) getLocallyOnlyForWarmUp(key string) (ByteView, error) {
@@ -288,6 +339,7 @@ func (g *Group) Warmup(keys []string) {
 }
 
 func (g *Group) Invalidate(key string) {
+	g.mainCache.remove(key)
 	if g.filter != nil {
 		g.filter.Remove(key)
 	}

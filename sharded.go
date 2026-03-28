@@ -71,6 +71,10 @@ func (sc *ShardedCache) get(key string) (value ByteView, ok bool) {
 	return sc.bucket(key).get(key)
 }
 
+func (sc *ShardedCache) remove(key string) {
+	sc.bucket(key).remove(key)
+}
+
 func (sc *ShardedCache) clearupExpired() {
 	for _, c := range sc.cs {
 		c.clearupExpired()
