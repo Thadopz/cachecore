@@ -31,9 +31,45 @@ type Group struct {
 	// It should return the data corresponding to the key.
 	getter Getter
 
-	// mainCache is the cache that holds the key-value pairs.
-	// It is protected by a mutex to ensure thread safety.
-	mainCache Cache
+	// activeCache serves all new reads/writes.
+	activeCache Cache
+
+	// fallbackCache is the previous cache kept for a short grace window after switch.
+	fallbackCache Cache
+
+	// routeMu protects active/fallback cache swapping and mode metadata.
+	routeMu sync.RWMutex
+
+	// mode records current cache mode.
+	mode CacheMode
+
+	// switchedAt tracks when the last cache mode switch happened.
+	switchedAt time.Time
+
+	// fallbackTTL controls how long fallbackCache can serve misses.
+	fallbackTTL time.Duration
+
+	// switchCooldown prevents rapid mode flapping.
+	switchCooldown time.Duration
+
+	// cacheBytes is the target capacity for newly created cache instance.
+	cacheBytes int64
+
+	// onEvicted callback is reused when creating new cache instances.
+	onEvicted func(key string, value ByteView)
+
+	// shardCount is used when switching to sharded mode.
+	shardCount uint32
+
+	// autoSwitchPolicy controls threshold-based dynamic switching.
+	autoSwitchPolicy AutoSwitchPolicy
+
+	// highStreak/lowStreak count consecutive intervals that satisfy thresholds.
+	highStreak int
+	lowStreak  int
+
+	// controllerStop stops the background auto switch controller.
+	controllerStop chan struct{}
 
 	// peers is used to pick a peer to get the value for a key.
 	// It is set by RegisterPeers and should not be nil after that.
@@ -77,21 +113,48 @@ type Filter interface {
 
 type Option func(*Options)
 
+type CacheMode int
+
+const (
+	CacheModeUnsharded CacheMode = iota
+	CacheModeSharded
+)
+
+type AutoSwitchPolicy struct {
+	Enable bool
+
+	// MissRateHigh triggers switch to sharded mode after HighConsecutive windows.
+	MissRateHigh float64
+
+	// MissRateLow triggers switch to unsharded mode after LowConsecutive windows.
+	MissRateLow float64
+
+	// HighConsecutive / LowConsecutive define required consecutive intervals.
+	HighConsecutive int
+	LowConsecutive  int
+}
+
 var (
 	ErrFilterNotFound = errors.New("key not found in filter")
+	ErrSwitchCooldown = errors.New("cache mode switch is in cooldown")
 	mu                sync.RWMutex
 	groups            = make(map[string]*Group)
 )
 
 type Options struct {
-	Filter    Filter
-	Janitor   *Janitor
-	onEvicted func(key string, value ByteView)
-	cache     Cache
-	useShards bool
-	shards    uint32
-	cacheTTL  time.Duration
-	ttlJitter time.Duration
+	Filter         Filter
+	Janitor        *Janitor
+	onEvicted      func(key string, value ByteView)
+	cache          Cache
+	useShards      bool
+	shards         uint32
+	cacheTTL       time.Duration
+	ttlJitter      time.Duration
+	fallbackTTL    time.Duration
+	cooldown       time.Duration
+	fallbackTTLSet bool
+	cooldownSet    bool
+	autoPolicy     AutoSwitchPolicy
 }
 
 func WithFilter(filter Filter) Option {
@@ -148,7 +211,30 @@ func WithRandomTTL(baseTTL, jitter time.Duration) Option {
 	}
 }
 
+func WithFallbackTTL(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.fallbackTTL = ttl
+		o.fallbackTTLSet = true
+	}
+}
+
+func WithSwitchCooldown(cooldown time.Duration) Option {
+	return func(o *Options) {
+		o.cooldown = cooldown
+		o.cooldownSet = true
+	}
+}
+
+func WithAutoSwitchByMissRate(policy AutoSwitchPolicy) Option {
+	return func(o *Options) {
+		o.autoPolicy = policy
+	}
+}
+
 func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Group {
+	if name == "" {
+		panic("group name is required")
+	}
 	if getter == nil {
 		panic("nil Getter")
 	}
@@ -176,17 +262,44 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		}
 	}
 
+	fallbackTTL := options.fallbackTTL
+	if !options.fallbackTTLSet {
+		fallbackTTL = 90 * time.Second
+	}
+
+	cooldown := options.cooldown
+	if !options.cooldownSet {
+		cooldown = 30 * time.Second
+	}
+
+	mode := CacheModeUnsharded
+	if options.useShards {
+		mode = CacheModeSharded
+	}
+
+	shardCount := options.shards
+	if shardCount == 0 {
+		shardCount = 256
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
-		name:           name,
-		getter:         getter,
-		mainCache:      mainCache,
-		loader:         &singleflight.Group{},
-		filter:         options.Filter,
-		janitor:        options.Janitor,
-		cacheTTL:       options.cacheTTL,
-		cacheTTLJitter: options.ttlJitter,
+		name:             name,
+		getter:           getter,
+		activeCache:      mainCache,
+		loader:           &singleflight.Group{},
+		filter:           options.Filter,
+		janitor:          options.Janitor,
+		cacheTTL:         options.cacheTTL,
+		cacheTTLJitter:   options.ttlJitter,
+		mode:             mode,
+		fallbackTTL:      fallbackTTL,
+		switchCooldown:   cooldown,
+		cacheBytes:       cacheBytes,
+		onEvicted:        options.onEvicted,
+		shardCount:       shardCount,
+		autoSwitchPolicy: options.autoPolicy,
 	}
 	if g.janitor != nil {
 		go g.janitor.Run(g)
@@ -196,6 +309,9 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 }
 
 func NewGroupWithFilter(name string, cacheBytes int64, getter Getter, filter Filter) *Group {
+	if name == "" {
+		panic("group name is required")
+	}
 	if filter == nil {
 		panic("nil Filter")
 	}
@@ -214,16 +330,239 @@ func (g *Group) Log(format string, v ...interface{}) {
 }
 
 func (g *Group) Get(key string) (ByteView, error) {
+	start := time.Now()
+	defer func() {
+		Stats.RecordGroupGetLatency(time.Since(start))
+	}()
+
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
 	Stats.IncGroupGets()
-	if v, ok := g.mainCache.get(key); ok {
-		Stats.IncCacheHits()
-		return v, nil
+	active, fallback := g.currentCaches()
+	if active != nil {
+		if v, ok := active.get(key); ok {
+			Stats.IncCacheHits()
+			return v, nil
+		}
+	}
+	if fallback != nil {
+		if v, ok := fallback.get(key); ok {
+			Stats.IncCacheHits()
+			if active != nil {
+				ttl := g.nextTTL()
+				if ttl > 0 {
+					active.addWithTTL(key, v, ttl)
+				} else {
+					active.add(key, v)
+				}
+			}
+			return v, nil
+		}
 	}
 	Stats.IncCacheMisses()
 	return g.load(key)
+}
+
+func (g *Group) currentCaches() (active Cache, fallback Cache) {
+	g.routeMu.RLock()
+	defer g.routeMu.RUnlock()
+	active = g.activeCache
+	if g.fallbackCache == nil {
+		return active, nil
+	}
+	if g.fallbackTTL <= 0 {
+		return active, nil
+	}
+	if g.fallbackTTL > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) > g.fallbackTTL {
+		return active, nil
+	}
+	return active, g.fallbackCache
+}
+
+func (g *Group) Mode() CacheMode {
+	g.routeMu.RLock()
+	defer g.routeMu.RUnlock()
+	return g.mode
+}
+
+func (g *Group) SwitchToSharded(shards uint32) error {
+	if shards == 0 {
+		shards = g.shardCount
+		if shards == 0 {
+			shards = 256
+		}
+	}
+	g.shardCount = shards
+	perShardBytes := g.cacheBytes / int64(shards)
+	if perShardBytes <= 0 {
+		perShardBytes = 1
+	}
+	newCache := newShardedCache(0, shards, perShardBytes, g.onEvicted)
+	return g.switchTo(newCache, CacheModeSharded)
+}
+
+func (g *Group) SwitchToUnsharded() error {
+	newCache := &cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}
+	return g.switchTo(newCache, CacheModeUnsharded)
+}
+
+func (g *Group) switchTo(newCache Cache, mode CacheMode) error {
+	g.routeMu.Lock()
+	defer g.routeMu.Unlock()
+
+	if g.mode == mode {
+		return nil
+	}
+	if g.switchCooldown > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) < g.switchCooldown {
+		Stats.IncSwitchSkippedCooldown()
+		return ErrSwitchCooldown
+	}
+
+	oldActive := g.activeCache
+	g.activeCache = newCache
+	g.fallbackCache = oldActive
+	g.mode = mode
+	g.switchedAt = time.Now()
+	g.highStreak = 0
+	g.lowStreak = 0
+	if mode == CacheModeSharded {
+		Stats.IncSwitchToSharded()
+	} else {
+		Stats.IncSwitchToUnsharded()
+	}
+	return nil
+}
+
+func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
+	g.routeMu.Lock()
+	defer g.routeMu.Unlock()
+
+	policy := g.autoSwitchPolicy
+	if !policy.Enable {
+		return nil
+	}
+	if policy.HighConsecutive <= 0 {
+		policy.HighConsecutive = 1
+	}
+	if policy.LowConsecutive <= 0 {
+		policy.LowConsecutive = 1
+	}
+	if policy.MissRateLow > policy.MissRateHigh {
+		policy.MissRateLow = policy.MissRateHigh
+	}
+
+	if g.mode == CacheModeUnsharded {
+		if missRate >= policy.MissRateHigh {
+			g.highStreak++
+		} else {
+			g.highStreak = 0
+		}
+		g.lowStreak = 0
+		if g.highStreak < policy.HighConsecutive {
+			return nil
+		}
+		if g.switchCooldown > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) < g.switchCooldown {
+			Stats.IncSwitchSkippedCooldown()
+			return ErrSwitchCooldown
+		}
+
+		shards := g.shardCount
+		if shards == 0 {
+			shards = 256
+		}
+		perShardBytes := g.cacheBytes / int64(shards)
+		if perShardBytes <= 0 {
+			perShardBytes = 1
+		}
+		oldActive := g.activeCache
+		g.activeCache = newShardedCache(0, shards, perShardBytes, g.onEvicted)
+		g.fallbackCache = oldActive
+		g.mode = CacheModeSharded
+		g.switchedAt = time.Now()
+		g.highStreak = 0
+		g.lowStreak = 0
+		Stats.IncSwitchToSharded()
+		return nil
+	}
+
+	if missRate <= policy.MissRateLow {
+		g.lowStreak++
+	} else {
+		g.lowStreak = 0
+	}
+	g.highStreak = 0
+	if g.lowStreak < policy.LowConsecutive {
+		return nil
+	}
+	if g.switchCooldown > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) < g.switchCooldown {
+		Stats.IncSwitchSkippedCooldown()
+		return ErrSwitchCooldown
+	}
+
+	oldActive := g.activeCache
+	g.activeCache = &cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}
+	g.fallbackCache = oldActive
+	g.mode = CacheModeUnsharded
+	g.switchedAt = time.Now()
+	g.highStreak = 0
+	g.lowStreak = 0
+	Stats.IncSwitchToUnsharded()
+	return nil
+}
+
+func (g *Group) StartAutoSwitchController(interval time.Duration, sampleMissRate func() float64) {
+	if interval <= 0 || sampleMissRate == nil {
+		return
+	}
+	g.routeMu.Lock()
+	if g.controllerStop != nil {
+		g.routeMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	g.controllerStop = stop
+	g.routeMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_ = g.EvaluateAutoSwitchOnce(sampleMissRate())
+				g.CleanupFallback()
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+func (g *Group) StopAutoSwitchController() {
+	g.routeMu.Lock()
+	stop := g.controllerStop
+	g.controllerStop = nil
+	g.routeMu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+}
+
+func (g *Group) CleanupFallback() {
+	g.routeMu.Lock()
+	defer g.routeMu.Unlock()
+	if g.fallbackCache == nil {
+		return
+	}
+	if g.fallbackTTL <= 0 {
+		g.fallbackCache = nil
+		return
+	}
+	if !g.switchedAt.IsZero() && time.Since(g.switchedAt) > g.fallbackTTL {
+		g.fallbackCache = nil
+	}
 }
 
 // if mainCache doesn't have the key, it should return an error, so that the getter can fallback to getFromPeer
@@ -273,10 +612,14 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	Stats.IncLocalLoads()
 	value := ByteView{b: cloneBytes(bytes)}
 	ttl := g.nextTTL()
+	active, _ := g.currentCaches()
+	if active == nil {
+		return value, nil
+	}
 	if ttl > 0 {
-		g.mainCache.addWithTTL(key, value, ttl)
+		active.addWithTTL(key, value, ttl)
 	} else {
-		g.mainCache.add(key, value)
+		active.add(key, value)
 	}
 	if g.filter != nil {
 		g.filter.Add(key)
@@ -339,7 +682,13 @@ func (g *Group) Warmup(keys []string) {
 }
 
 func (g *Group) Invalidate(key string) {
-	g.mainCache.remove(key)
+	active, fallback := g.currentCaches()
+	if active != nil {
+		active.remove(key)
+	}
+	if fallback != nil {
+		fallback.remove(key)
+	}
 	if g.filter != nil {
 		g.filter.Remove(key)
 	}
@@ -356,7 +705,14 @@ func (j *Janitor) Run(g *Group) {
 	for {
 		select {
 		case <-ticker.C:
-			g.mainCache.clearupExpired()
+			active, fallback := g.currentCaches()
+			if active != nil {
+				active.clearupExpired()
+			}
+			if fallback != nil {
+				fallback.clearupExpired()
+			}
+			g.CleanupFallback()
 		case <-j.stop:
 			return
 		}

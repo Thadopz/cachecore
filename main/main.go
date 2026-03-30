@@ -94,6 +94,11 @@ func startCacheServer(addr string, addrs []string, gcache *groupcache.Group) {
 func startAPIServer(apiAddr string, gcache *groupcache.Group) {
 	http.Handle("/api", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			go func() {
+				groupcache.Stats.RecordAPILatency(time.Since(start))
+			}()
+
 			key := r.URL.Query().Get("key")
 			view, err := gcache.Get(key)
 			groupcache.Stats.IncAPIRequests()
@@ -136,6 +141,15 @@ func startAPIServer(apiAddr string, gcache *groupcache.Group) {
 				"rates": map[string]float64{
 					"hit_rate_percent":   hitRate,
 					"error_rate_percent": errorRate,
+					"api_avg_ms":         float64(snapshot.APILatencyTotalMicros) / float64(max(snapshot.APILatencyCount, 1)) / 1000.0,
+					"api_p95_ms":         float64(snapshot.APILastP95Micros) / 1000.0,
+					"api_p99_ms":         float64(snapshot.APILastP99Micros) / 1000.0,
+					"group_get_avg_ms":   float64(snapshot.GroupGetTotalMicros) / float64(max(snapshot.GroupGetLatencyCount, 1)) / 1000.0,
+					"group_get_p95_ms":   float64(snapshot.GroupGetLastP95Micros) / 1000.0,
+					"group_get_p99_ms":   float64(snapshot.GroupGetLastP99Micros) / 1000.0,
+					"cache_get_avg_ms":   float64(snapshot.CacheGetTotalMicros) / float64(max(snapshot.CacheGetLatencyCount, 1)) / 1000.0,
+					"cache_get_p95_ms":   float64(snapshot.CacheGetLastP95Micros) / 1000.0,
+					"cache_get_p99_ms":   float64(snapshot.CacheGetLastP99Micros) / 1000.0,
 				},
 			}
 

@@ -51,6 +51,11 @@ func (c *cache) addWithTTL(key string, value ByteView, ttl time.Duration) {
 }
 
 func (c *cache) get(key string) (value ByteView, ok bool) {
+	start := time.Now()
+	defer func() {
+		Stats.RecordCacheGetLatency(time.Since(start))
+	}()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.lru == nil {
