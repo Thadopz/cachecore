@@ -4,4 +4,5 @@ perf/test-logs/pprof/*.pb.gz
 test-logs/pprof/*.pb.gz
 test-logs/*.log
 test-logs/*.json
-.vscode/*.json.
+.vscode/*.json
+summary.md
