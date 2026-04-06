@@ -68,6 +68,21 @@ type Group struct {
 	highStreak int
 	lowStreak  int
 
+	// versionMu protects key version metadata used by fallback refill comparison.
+	versionMu sync.RWMutex
+
+	// versionSeq is a monotonically increasing sequence for version stamps.
+	versionSeq uint64
+
+	// latestVersion tracks the latest known version per key.
+	latestVersion map[string]uint64
+
+	// activeVersions records key versions currently written to activeCache.
+	activeVersions map[string]uint64
+
+	// fallbackVersions records key versions currently retained in fallbackCache.
+	fallbackVersions map[string]uint64
+
 	// controllerStop stops the background auto switch controller.
 	controllerStop chan struct{}
 
@@ -300,6 +315,9 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		onEvicted:        options.onEvicted,
 		shardCount:       shardCount,
 		autoSwitchPolicy: options.autoPolicy,
+		latestVersion:    make(map[string]uint64),
+		activeVersions:   make(map[string]uint64),
+		fallbackVersions: make(map[string]uint64),
 	}
 	if g.janitor != nil {
 		go g.janitor.Run(g)
@@ -349,13 +367,8 @@ func (g *Group) Get(key string) (ByteView, error) {
 	if fallback != nil {
 		if v, ok := fallback.get(key); ok {
 			Stats.IncCacheHits()
-			if active != nil {
-				ttl := g.nextTTL()
-				if ttl > 0 {
-					active.addWithTTL(key, v, ttl)
-				} else {
-					active.add(key, v)
-				}
+			if version, canRefill := g.fallbackRefillVersion(key); canRefill {
+				g.tryRefillActiveFromFallback(key, v, version)
 			}
 			return v, nil
 		}
@@ -387,13 +400,16 @@ func (g *Group) Mode() CacheMode {
 }
 
 func (g *Group) SwitchToSharded(shards uint32) error {
+	if g.Mode() == CacheModeSharded {
+		return nil
+	}
 	if shards == 0 {
-		shards = g.shardCount
+		shards = atomic.LoadUint32(&g.shardCount)
 		if shards == 0 {
 			shards = 256
 		}
 	}
-	g.shardCount = shards
+	atomic.StoreUint32(&g.shardCount, shards)
 	perShardBytes := g.cacheBytes / int64(shards)
 	if perShardBytes <= 0 {
 		perShardBytes = 1
@@ -403,6 +419,9 @@ func (g *Group) SwitchToSharded(shards uint32) error {
 }
 
 func (g *Group) SwitchToUnsharded() error {
+	if g.Mode() == CacheModeUnsharded {
+		return nil
+	}
 	newCache := &cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}
 	return g.switchTo(newCache, CacheModeUnsharded)
 }
@@ -419,13 +438,7 @@ func (g *Group) switchTo(newCache Cache, mode CacheMode) error {
 		return ErrSwitchCooldown
 	}
 
-	oldActive := g.activeCache
-	g.activeCache = newCache
-	g.fallbackCache = oldActive
-	g.mode = mode
-	g.switchedAt = time.Now()
-	g.highStreak = 0
-	g.lowStreak = 0
+	g.applySwitchLocked(newCache, mode)
 	if mode == CacheModeSharded {
 		Stats.IncSwitchToSharded()
 	} else {
@@ -467,7 +480,7 @@ func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
 			return ErrSwitchCooldown
 		}
 
-		shards := g.shardCount
+		shards := atomic.LoadUint32(&g.shardCount)
 		if shards == 0 {
 			shards = 256
 		}
@@ -475,13 +488,7 @@ func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
 		if perShardBytes <= 0 {
 			perShardBytes = 1
 		}
-		oldActive := g.activeCache
-		g.activeCache = newShardedCache(0, shards, perShardBytes, g.onEvicted)
-		g.fallbackCache = oldActive
-		g.mode = CacheModeSharded
-		g.switchedAt = time.Now()
-		g.highStreak = 0
-		g.lowStreak = 0
+		g.applySwitchLocked(newShardedCache(0, shards, perShardBytes, g.onEvicted), CacheModeSharded)
 		Stats.IncSwitchToSharded()
 		return nil
 	}
@@ -500,15 +507,97 @@ func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
 		return ErrSwitchCooldown
 	}
 
+	g.applySwitchLocked(&cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}, CacheModeUnsharded)
+	Stats.IncSwitchToUnsharded()
+	return nil
+}
+
+func (g *Group) applySwitchLocked(newCache Cache, mode CacheMode) {
 	oldActive := g.activeCache
-	g.activeCache = &cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}
+	g.activeCache = newCache
 	g.fallbackCache = oldActive
-	g.mode = CacheModeUnsharded
+	g.mode = mode
 	g.switchedAt = time.Now()
 	g.highStreak = 0
 	g.lowStreak = 0
-	Stats.IncSwitchToUnsharded()
-	return nil
+
+	g.versionMu.Lock()
+	g.fallbackVersions = g.activeVersions
+	g.activeVersions = make(map[string]uint64)
+	g.versionMu.Unlock()
+}
+
+func (g *Group) nextVersionLocked(key string) uint64 {
+	g.versionSeq++
+	v := g.versionSeq
+	g.latestVersion[key] = v
+	return v
+}
+
+func (g *Group) assignNewActiveVersion(key string) uint64 {
+	g.versionMu.Lock()
+	defer g.versionMu.Unlock()
+	v := g.nextVersionLocked(key)
+	g.activeVersions[key] = v
+	return v
+}
+
+func (g *Group) recordActiveVersion(key string, version uint64) {
+	if version == 0 {
+		return
+	}
+	g.versionMu.Lock()
+	defer g.versionMu.Unlock()
+	if latest, ok := g.latestVersion[key]; !ok || version > latest {
+		g.latestVersion[key] = version
+	}
+	g.activeVersions[key] = version
+}
+
+func (g *Group) markInvalidated(key string) {
+	g.versionMu.Lock()
+	defer g.versionMu.Unlock()
+	g.nextVersionLocked(key)
+	delete(g.activeVersions, key)
+	delete(g.fallbackVersions, key)
+}
+
+func (g *Group) fallbackRefillVersion(key string) (uint64, bool) {
+	g.versionMu.RLock()
+	defer g.versionMu.RUnlock()
+
+	fallbackVersion, ok := g.fallbackVersions[key]
+	if !ok || fallbackVersion == 0 {
+		return 0, false
+	}
+	latest, ok := g.latestVersion[key]
+	if !ok {
+		return 0, false
+	}
+	if fallbackVersion != latest {
+		return 0, false
+	}
+	return fallbackVersion, true
+}
+
+func (g *Group) tryRefillActiveFromFallback(key string, value ByteView, version uint64) {
+	if version == 0 {
+		return
+	}
+	g.routeMu.RLock()
+	defer g.routeMu.RUnlock()
+
+	active := g.activeCache
+	if active == nil {
+		return
+	}
+	ttl := g.nextTTL()
+	if ttl > 0 {
+		active.addWithTTL(key, value, ttl)
+	} else {
+		active.add(key, value)
+	}
+	g.recordActiveVersion(key, version)
 }
 
 func (g *Group) StartAutoSwitchController(interval time.Duration, sampleMissRate func() float64) {
@@ -612,6 +701,7 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	Stats.IncLocalLoads()
 	value := ByteView{b: cloneBytes(bytes)}
 	ttl := g.nextTTL()
+	g.assignNewActiveVersion(key)
 	active, _ := g.currentCaches()
 	if active == nil {
 		return value, nil
@@ -682,6 +772,7 @@ func (g *Group) Warmup(keys []string) {
 }
 
 func (g *Group) Invalidate(key string) {
+	g.markInvalidated(key)
 	active, fallback := g.currentCaches()
 	if active != nil {
 		active.remove(key)

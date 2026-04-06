@@ -267,6 +267,48 @@ func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
 	}
 }
 
+func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-fallback-version-compare", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("v-" + key), nil
+	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
+
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("warm get failed: %v", err)
+	}
+	if err := g.SwitchToSharded(8); err != nil {
+		t.Fatalf("switch to sharded failed: %v", err)
+	}
+
+	// Simulate a newer external version so fallback version becomes stale.
+	g.versionMu.Lock()
+	g.versionSeq++
+	g.latestVersion["Tom"] = g.versionSeq
+	g.versionMu.Unlock()
+
+	v, err := g.Get("Tom")
+	if err != nil {
+		t.Fatalf("get after version advance failed: %v", err)
+	}
+	if got := v.String(); got != "v-Tom" {
+		t.Fatalf("unexpected value from fallback: got %s, want v-Tom", got)
+	}
+
+	g.routeMu.RLock()
+	active := g.activeCache
+	g.routeMu.RUnlock()
+	if active == nil {
+		t.Fatalf("active cache should exist")
+	}
+	if _, ok := active.get("Tom"); ok {
+		t.Fatalf("stale fallback should not refill active cache")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("getter should not be called for fallback hit: got %d, want 1", got)
+	}
+}
+
 func TestFallbackExpiresAndCleanupStopsServingOldCache(t *testing.T) {
 	var calls int32
 	g := NewGroup("test-fallback-expire", 1<<20, GetterFunc(func(key string) ([]byte, error) {
