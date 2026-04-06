@@ -281,11 +281,10 @@ func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
 		t.Fatalf("switch to sharded failed: %v", err)
 	}
 
-	// Simulate a newer external version so fallback version becomes stale.
-	g.versionMu.Lock()
-	g.versionSeq++
-	g.latestVersion["Tom"] = g.versionSeq
-	g.versionMu.Unlock()
+	// Simulate a newer cache generation so the fallback entry epoch becomes stale.
+	g.routeMu.Lock()
+	g.fallbackEpoch++
+	g.routeMu.Unlock()
 
 	v, err := g.Get("Tom")
 	if err != nil {

@@ -1,0 +1,239 @@
+package cache
+
+import (
+	"errors"
+	"goCache/singleflight"
+	"sync"
+	"time"
+)
+
+type Getter interface {
+	Get(key string) ([]byte, error)
+}
+
+type GetterFunc func(key string) ([]byte, error)
+
+func (f GetterFunc) Get(key string) ([]byte, error) {
+	return f(key)
+}
+
+type Filter interface {
+	// Add adds an item to the filter.
+	Add(item string)
+
+	// Contains checks if an item is in the filter.
+	// It should return true if the item is probably in the filter,
+	// and false if it is definitely not in the filter.
+	Contains(item string) bool
+
+	// Remove removes an item from the filter.
+	// It should ensure that the item is no longer considered to be in the filter.
+	Remove(item string)
+}
+
+type Option func(*Options)
+
+type CacheMode int
+
+const (
+	CacheModeUnsharded CacheMode = iota
+	CacheModeSharded
+)
+
+type AutoSwitchPolicy struct {
+	Enable bool
+
+	// MissRateHigh triggers switch to sharded mode after HighConsecutive windows.
+	MissRateHigh float64
+
+	// MissRateLow triggers switch to unsharded mode after LowConsecutive windows.
+	MissRateLow float64
+
+	// HighConsecutive / LowConsecutive define required consecutive intervals.
+	HighConsecutive int
+	LowConsecutive  int
+}
+
+var (
+	ErrFilterNotFound = errors.New("key not found in filter")
+	ErrSwitchCooldown = errors.New("cache mode switch is in cooldown")
+	mu                sync.RWMutex
+	groups            = make(map[string]*Group)
+)
+
+type Options struct {
+	Filter         Filter
+	Janitor        *Janitor
+	onEvicted      func(key string, value ByteView)
+	cache          Cache
+	useShards      bool
+	shards         uint32
+	cacheTTL       time.Duration
+	ttlJitter      time.Duration
+	fallbackTTL    time.Duration
+	cooldown       time.Duration
+	fallbackTTLSet bool
+	cooldownSet    bool
+	autoPolicy     AutoSwitchPolicy
+}
+
+func WithFilter(filter Filter) Option {
+	return func(o *Options) {
+		o.Filter = filter
+	}
+}
+
+func WithJanitor(interval time.Duration) Option {
+	return func(o *Options) {
+		o.Janitor = NewJanitor(interval)
+	}
+}
+
+func WithOnEvicted(onEvicted func(key string, value ByteView)) Option {
+	return func(o *Options) {
+		o.onEvicted = onEvicted
+	}
+}
+
+func WithCache(cache Cache) Option {
+	return func(o *Options) {
+		o.cache = cache
+	}
+}
+
+func WithShardedCache(shards uint32) Option {
+	return func(o *Options) {
+		o.useShards = true
+		o.shards = shards
+	}
+}
+
+func WithRandomTTL(baseTTL, jitter time.Duration) Option {
+	return func(o *Options) {
+		if baseTTL <= 0 {
+			o.cacheTTL = 0
+			o.ttlJitter = 0
+			return
+		}
+		if jitter < 0 {
+			jitter = -jitter
+		}
+		o.cacheTTL = baseTTL
+		o.ttlJitter = jitter
+	}
+}
+
+func WithFallbackTTL(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.fallbackTTL = ttl
+		o.fallbackTTLSet = true
+	}
+}
+
+func WithSwitchCooldown(cooldown time.Duration) Option {
+	return func(o *Options) {
+		o.cooldown = cooldown
+		o.cooldownSet = true
+	}
+}
+
+func WithAutoSwitchByMissRate(policy AutoSwitchPolicy) Option {
+	return func(o *Options) {
+		o.autoPolicy = policy
+	}
+}
+
+func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Group {
+	if name == "" {
+		panic("group name is required")
+	}
+	if getter == nil {
+		panic("nil Getter")
+	}
+	options := &Options{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(options)
+		}
+	}
+
+	mainCache := options.cache
+	if mainCache == nil {
+		if options.useShards {
+			shards := options.shards
+			if shards == 0 {
+				shards = 256
+			}
+			perShardBytes := cacheBytes / int64(shards)
+			if perShardBytes <= 0 {
+				perShardBytes = 1
+			}
+			mainCache = newShardedCache(0, shards, perShardBytes, options.onEvicted)
+		} else {
+			mainCache = &cache{cacheBytes: cacheBytes, onEvicted: options.onEvicted}
+		}
+	}
+
+	fallbackTTL := options.fallbackTTL
+	if !options.fallbackTTLSet {
+		fallbackTTL = 90 * time.Second
+	}
+
+	cooldown := options.cooldown
+	if !options.cooldownSet {
+		cooldown = 30 * time.Second
+	}
+
+	mode := CacheModeUnsharded
+	if options.useShards {
+		mode = CacheModeSharded
+	}
+
+	shardCount := options.shards
+	if shardCount == 0 {
+		shardCount = 256
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	g := &Group{
+		name:             name,
+		getter:           getter,
+		activeCache:      mainCache,
+		loader:           &singleflight.Group{},
+		filter:           options.Filter,
+		janitor:          options.Janitor,
+		cacheTTL:         options.cacheTTL,
+		cacheTTLJitter:   options.ttlJitter,
+		mode:             mode,
+		fallbackTTL:      fallbackTTL,
+		switchCooldown:   cooldown,
+		cacheBytes:       cacheBytes,
+		onEvicted:        options.onEvicted,
+		shardCount:       shardCount,
+		autoSwitchPolicy: options.autoPolicy,
+		activeEpoch:      1,
+	}
+	if g.janitor != nil {
+		go g.janitor.Run(g)
+	}
+	groups[name] = g
+	return g
+}
+
+func NewGroupWithFilter(name string, cacheBytes int64, getter Getter, filter Filter) *Group {
+	if name == "" {
+		panic("group name is required")
+	}
+	if filter == nil {
+		panic("nil Filter")
+	}
+	return NewGroup(name, cacheBytes, getter, WithFilter(filter))
+}
+
+func GetGroup(name string) *Group {
+	mu.RLock()
+	g := groups[name]
+	mu.RUnlock()
+	return g
+}
