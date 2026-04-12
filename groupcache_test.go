@@ -107,6 +107,104 @@ func TestGroupGetUsesSingleflightForConcurrentRequests(t *testing.T) {
 	}
 }
 
+func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
+	var calls int32
+	started := make(chan struct{})
+	var once sync.Once
+
+	g := NewGroup("test-singleflight-wait-timeout", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+		once.Do(func() { close(started) })
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(80 * time.Millisecond)
+		return []byte("slow"), nil
+	}), WithSingleflightWaitTTL(15*time.Millisecond))
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := g.Get("Tom")
+		firstDone <- err
+	}()
+
+	<-started
+	v, err := g.Get("Tom")
+	if !errors.Is(err, ErrSingleflightWaitTimeout) {
+		t.Fatalf("expected ErrSingleflightWaitTimeout, got value=%q err=%v", v.String(), err)
+	}
+
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, ErrSingleflightWaitTimeout) {
+			t.Fatalf("first load should also timeout under strict waitTTL policy: %v", err)
+		}
+	default:
+		// still running means the second request really exited before first load finished.
+	}
+
+	err = <-firstDone
+	if !errors.Is(err, ErrSingleflightWaitTimeout) {
+		t.Fatalf("first load should timeout: %v", err)
+	}
+
+	time.Sleep(90 * time.Millisecond)
+	v, err = g.Get("Tom")
+	if err != nil {
+		t.Fatalf("value should be available after inflight load completes: %v", err)
+	}
+	if got := v.String(); got != "slow" {
+		t.Fatalf("unexpected cached value after inflight completion: got %s, want slow", got)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("timeout path should not amplify loader calls: got %d", got)
+	}
+}
+
+func TestLoadSingleflightWaitTTLServesFallback(t *testing.T) {
+	var calls int32
+	var slowMode int32
+
+	g := NewGroup("test-singleflight-wait-fallback", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		if atomic.LoadInt32(&slowMode) == 1 {
+			time.Sleep(80 * time.Millisecond)
+			return []byte("v2"), nil
+		}
+		return []byte("v1"), nil
+	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0), WithSingleflightWaitTTL(15*time.Millisecond))
+
+	if _, err := g.Get("Tom"); err != nil {
+		t.Fatalf("warm get failed: %v", err)
+	}
+	if err := g.SwitchToSharded(8); err != nil {
+		t.Fatalf("switch to sharded failed: %v", err)
+	}
+
+	atomic.StoreInt32(&slowMode, 1)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := g.load("Tom")
+		firstDone <- err
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	v, err := g.load("Tom")
+	if err != nil {
+		t.Fatalf("second load should degrade to fallback, got err=%v", err)
+	}
+	if got := v.String(); got != "v1" {
+		t.Fatalf("expected fallback value v1, got %s", got)
+	}
+
+	err = <-firstDone
+	if err != nil {
+		t.Fatalf("first load failed: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected 2 total getter calls (warm + one inflight), got %d", got)
+	}
+}
+
 func TestGroupGetBlockedByFilterWhenReady(t *testing.T) {
 	var calls int32
 	filter := newTestFilter()

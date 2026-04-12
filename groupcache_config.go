@@ -57,6 +57,7 @@ type AutoSwitchPolicy struct {
 var (
 	ErrFilterNotFound = errors.New("key not found in filter")
 	ErrSwitchCooldown = errors.New("cache mode switch is in cooldown")
+	ErrSingleflightWaitTimeout = errors.New("singleflight wait timeout")
 	mu                sync.RWMutex
 	groups            = make(map[string]*Group)
 )
@@ -72,8 +73,10 @@ type Options struct {
 	ttlJitter      time.Duration
 	fallbackTTL    time.Duration
 	cooldown       time.Duration
+	loadWaitTTL    time.Duration
 	fallbackTTLSet bool
 	cooldownSet    bool
+	loadWaitTTLSet bool
 	autoPolicy     AutoSwitchPolicy
 }
 
@@ -134,6 +137,13 @@ func WithSwitchCooldown(cooldown time.Duration) Option {
 	return func(o *Options) {
 		o.cooldown = cooldown
 		o.cooldownSet = true
+	}
+}
+
+func WithSingleflightWaitTTL(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.loadWaitTTL = ttl
+		o.loadWaitTTLSet = true
 	}
 }
 
@@ -201,6 +211,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		getter:           getter,
 		activeCache:      mainCache,
 		loader:           &singleflight.Group{},
+		singleflightWaitTTL: options.loadWaitTTL,
 		filter:           options.Filter,
 		janitor:          options.Janitor,
 		cacheTTL:         options.cacheTTL,

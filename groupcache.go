@@ -74,6 +74,10 @@ type Group struct {
 	// even if there are concurrent requests for the same key.
 	loader *singleflight.Group
 
+	// singleflightWaitTTL bounds how long a caller waits for an inflight load.
+	// <= 0 keeps the original behavior (wait until completion).
+	singleflightWaitTTL time.Duration
+
 	// filter is used to track which keys are present in the cache,
 	// to avoid unnecessary calls to the getter.
 	// it is optional and can be nil if not needed.
@@ -144,7 +148,7 @@ func (g *Group) currentCaches() (active Cache, fallback Cache) {
 
 // if mainCache doesn't have the key, it should return an error, so that the getter can fallback to getFromPeer
 func (g *Group) load(key string) (value ByteView, err error) {
-	v, err := g.loader.Do(key, func() (interface{}, error) {
+	loadFn := func() (interface{}, error) {
 		if g.peers != nil {
 			if peer, ok := g.peers.PickPeer(key); ok {
 				if value, err := g.getFromPeer(peer, key); err == nil {
@@ -154,12 +158,55 @@ func (g *Group) load(key string) (value ByteView, err error) {
 			}
 		}
 		return g.getLocally(key)
-	})
-	if err == nil {
-		value = v.(ByteView)
-		return value, nil
 	}
-	return
+
+	if g.singleflightWaitTTL <= 0 {
+		v, err := g.loader.Do(key, loadFn)
+		if err == nil {
+			value = v.(ByteView)
+			return value, nil
+		}
+		return ByteView{}, err
+	}
+
+	resCh := g.loader.DoChan(key, loadFn)
+	timer := time.NewTimer(g.singleflightWaitTTL)
+	defer timer.Stop()
+
+	select {
+	case res := <-resCh:
+		if res.Err != nil {
+			return ByteView{}, res.Err
+		}
+		return res.Val.(ByteView), nil
+	case <-timer.C:
+		if v, ok := g.degradeFromCaches(key); ok {
+			g.Log("singleflight wait timeout key=%s, fallback served", key)
+			return v, nil
+		}
+		g.Log("singleflight wait timeout key=%s, no fallback", key)
+		return ByteView{}, ErrSingleflightWaitTimeout
+	}
+}
+
+func (g *Group) degradeFromCaches(key string) (ByteView, bool) {
+	active, fallback := g.currentCaches()
+	if active != nil {
+		if v, ok := active.get(key); ok {
+			Stats.IncCacheHits()
+			return v, true
+		}
+	}
+	if fallback != nil {
+		if v, ok := fallback.get(key); ok {
+			Stats.IncCacheHits()
+			if g.shouldRefillFromFallback(v) {
+				g.tryRefillActiveFromFallback(key, v)
+			}
+			return v, true
+		}
+	}
+	return ByteView{}, false
 }
 
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
