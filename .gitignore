@@ -6,3 +6,6 @@ test-logs/*.log
 test-logs/*.json
 .vscode/*.json
 summary.md
+*.exe
+test-logs
+.github
