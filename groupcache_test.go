@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -39,7 +40,7 @@ func (f *testFilter) Remove(item string) {
 
 func TestGroupGetCachesHotKey(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-cache-hot-key", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-cache-hot-key", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		if key != "Tom" {
 			return nil, fmt.Errorf("unexpected key: %s", key)
@@ -47,7 +48,7 @@ func TestGroupGetCachesHotKey(t *testing.T) {
 		return []byte("630"), nil
 	}))
 
-	v1, err := g.Get("Tom")
+	v1, err := g.Get(context.Background(), "Tom")
 	if err != nil {
 		t.Fatalf("first get failed: %v", err)
 	}
@@ -55,7 +56,7 @@ func TestGroupGetCachesHotKey(t *testing.T) {
 		t.Fatalf("unexpected first value: got %s, want 630", got)
 	}
 
-	v2, err := g.Get("Tom")
+	v2, err := g.Get(context.Background(), "Tom")
 	if err != nil {
 		t.Fatalf("second get failed: %v", err)
 	}
@@ -70,7 +71,7 @@ func TestGroupGetCachesHotKey(t *testing.T) {
 
 func TestGroupGetUsesSingleflightForConcurrentRequests(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-singleflight-hot-key", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-singleflight-hot-key", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		time.Sleep(40 * time.Millisecond)
 		return []byte("589"), nil
@@ -83,7 +84,7 @@ func TestGroupGetUsesSingleflightForConcurrentRequests(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := g.Get("Jack")
+			v, err := g.Get(context.Background(), "Jack")
 			if err != nil {
 				errCh <- err
 				return
@@ -112,7 +113,7 @@ func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
 	started := make(chan struct{})
 	var once sync.Once
 
-	g := NewGroup("test-singleflight-wait-timeout", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-singleflight-wait-timeout", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		once.Do(func() { close(started) })
 		atomic.AddInt32(&calls, 1)
 		time.Sleep(80 * time.Millisecond)
@@ -121,12 +122,12 @@ func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
 
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := g.Get("Tom")
+		_, err := g.Get(context.Background(), "Tom")
 		firstDone <- err
 	}()
 
 	<-started
-	v, err := g.Get("Tom")
+	v, err := g.Get(context.Background(), "Tom")
 	if !errors.Is(err, ErrSingleflightWaitTimeout) {
 		t.Fatalf("expected ErrSingleflightWaitTimeout, got value=%q err=%v", v.String(), err)
 	}
@@ -146,7 +147,7 @@ func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
 	}
 
 	time.Sleep(90 * time.Millisecond)
-	v, err = g.Get("Tom")
+	v, err = g.Get(context.Background(), "Tom")
 	if err != nil {
 		t.Fatalf("value should be available after inflight load completes: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestLoadSingleflightWaitTTLServesFallback(t *testing.T) {
 	var calls int32
 	var slowMode int32
 
-	g := NewGroup("test-singleflight-wait-fallback", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-singleflight-wait-fallback", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		if atomic.LoadInt32(&slowMode) == 1 {
 			time.Sleep(80 * time.Millisecond)
@@ -172,7 +173,7 @@ func TestLoadSingleflightWaitTTLServesFallback(t *testing.T) {
 		return []byte("v1"), nil
 	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0), WithSingleflightWaitTTL(15*time.Millisecond))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("warm get failed: %v", err)
 	}
 	if err := g.SwitchToSharded(8); err != nil {
@@ -182,12 +183,12 @@ func TestLoadSingleflightWaitTTLServesFallback(t *testing.T) {
 	atomic.StoreInt32(&slowMode, 1)
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := g.load("Tom")
+		_, err := g.load(context.Background(), "Tom")
 		firstDone <- err
 	}()
 
 	time.Sleep(5 * time.Millisecond)
-	v, err := g.load("Tom")
+	v, err := g.load(context.Background(), "Tom")
 	if err != nil {
 		t.Fatalf("second load should degrade to fallback, got err=%v", err)
 	}
@@ -208,13 +209,13 @@ func TestLoadSingleflightWaitTTLServesFallback(t *testing.T) {
 func TestGroupGetBlockedByFilterWhenReady(t *testing.T) {
 	var calls int32
 	filter := newTestFilter()
-	g := NewGroupWithFilter("test-filter-block", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroupWithFilter("test-filter-block", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("value"), nil
 	}), filter)
 	g.filterReady.Store(true)
 
-	_, err := g.Get("missing-key")
+	_, err := g.Get(context.Background(), "missing-key")
 	if !errors.Is(err, ErrFilterNotFound) {
 		t.Fatalf("expected ErrFilterNotFound, got: %v", err)
 	}
@@ -225,7 +226,7 @@ func TestGroupGetBlockedByFilterWhenReady(t *testing.T) {
 
 func TestWarmupSetsReadyOnSuccess(t *testing.T) {
 	filter := newTestFilter()
-	g := NewGroupWithFilter("test-warmup-success", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroupWithFilter("test-warmup-success", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		return []byte("ok"), nil
 	}), filter)
 
@@ -238,7 +239,7 @@ func TestWarmupSetsReadyOnSuccess(t *testing.T) {
 
 func TestWarmupKeepsNotReadyOnFailure(t *testing.T) {
 	filter := newTestFilter()
-	g := NewGroupWithFilter("test-warmup-failure", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroupWithFilter("test-warmup-failure", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		if key == "missing" {
 			return nil, fmt.Errorf("not found")
 		}
@@ -254,12 +255,12 @@ func TestWarmupKeepsNotReadyOnFailure(t *testing.T) {
 
 func TestGroupWithRandomTTLExpiresEntry(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-random-ttl-expire", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-random-ttl-expire", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v"), nil
 	}), WithRandomTTL(40*time.Millisecond, 0))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("first get failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
@@ -267,7 +268,7 @@ func TestGroupWithRandomTTLExpiresEntry(t *testing.T) {
 	}
 
 	time.Sleep(60 * time.Millisecond)
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("second get failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -276,7 +277,7 @@ func TestGroupWithRandomTTLExpiresEntry(t *testing.T) {
 }
 
 func TestGroupWithRandomTTLSamplesWithinRange(t *testing.T) {
-	g := NewGroup("test-random-ttl-range", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-random-ttl-range", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		return []byte("v"), nil
 	}), WithRandomTTL(100*time.Millisecond, 30*time.Millisecond))
 
@@ -293,19 +294,19 @@ func TestGroupWithRandomTTLSamplesWithinRange(t *testing.T) {
 
 func TestInvalidateRemovesMainCacheEntry(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-invalidate-main-cache", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-invalidate-main-cache", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("value"), nil
 	}))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("first get failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("getter call count after first get: got %d, want 1", got)
 	}
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("second get failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
@@ -314,7 +315,7 @@ func TestInvalidateRemovesMainCacheEntry(t *testing.T) {
 
 	g.Invalidate("Tom")
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("third get failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -324,12 +325,12 @@ func TestInvalidateRemovesMainCacheEntry(t *testing.T) {
 
 func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-switch-fallback-refill", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-switch-fallback-refill", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v-" + key), nil
 	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("warm get failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
@@ -343,7 +344,7 @@ func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
 		t.Fatalf("unexpected mode after switch: got %v, want sharded", mode)
 	}
 
-	v, err := g.Get("Tom")
+	v, err := g.Get(context.Background(), "Tom")
 	if err != nil {
 		t.Fatalf("get after switch failed: %v", err)
 	}
@@ -367,12 +368,12 @@ func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
 
 func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-fallback-version-compare", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-fallback-version-compare", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v-" + key), nil
 	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("warm get failed: %v", err)
 	}
 	if err := g.SwitchToSharded(8); err != nil {
@@ -384,7 +385,7 @@ func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
 	g.fallbackEpoch++
 	g.routeMu.Unlock()
 
-	v, err := g.Get("Tom")
+	v, err := g.Get(context.Background(), "Tom")
 	if err != nil {
 		t.Fatalf("get after version advance failed: %v", err)
 	}
@@ -408,12 +409,12 @@ func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
 
 func TestFallbackExpiresAndCleanupStopsServingOldCache(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-fallback-expire", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-fallback-expire", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v"), nil
 	}), WithFallbackTTL(30*time.Millisecond), WithSwitchCooldown(0))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("warm get failed: %v", err)
 	}
 	if err := g.SwitchToSharded(4); err != nil {
@@ -423,7 +424,7 @@ func TestFallbackExpiresAndCleanupStopsServingOldCache(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	g.CleanupFallback()
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("get after fallback cleanup failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -433,7 +434,7 @@ func TestFallbackExpiresAndCleanupStopsServingOldCache(t *testing.T) {
 
 func TestFallbackTTLZeroNeverServesFallback(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-fallback-ttl-zero", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-fallback-ttl-zero", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v"), nil
 	}), WithFallbackTTL(0), WithSwitchCooldown(0))
@@ -444,7 +445,7 @@ func TestFallbackTTLZeroNeverServesFallback(t *testing.T) {
 		t.Fatalf("unexpected initial mode: got %v, want unsharded", mode)
 	}
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("warm get failed: %v", err)
 	}
 	if err := g.SwitchToSharded(4); err != nil {
@@ -465,7 +466,7 @@ func TestFallbackTTLZeroNeverServesFallback(t *testing.T) {
 		t.Fatalf("new active cache should be cold right after switch")
 	}
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("get after switch failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -475,12 +476,12 @@ func TestFallbackTTLZeroNeverServesFallback(t *testing.T) {
 
 func TestInvalidateRemovesFromActiveAndFallback(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-invalidate-active-fallback", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-invalidate-active-fallback", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("x"), nil
 	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("warm get failed: %v", err)
 	}
 	if err := g.SwitchToSharded(4); err != nil {
@@ -489,7 +490,7 @@ func TestInvalidateRemovesFromActiveAndFallback(t *testing.T) {
 
 	g.Invalidate("Tom")
 
-	if _, err := g.Get("Tom"); err != nil {
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
 		t.Fatalf("get after invalidate failed: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
@@ -498,7 +499,7 @@ func TestInvalidateRemovesFromActiveAndFallback(t *testing.T) {
 }
 
 func TestSwitchRespectsCooldown(t *testing.T) {
-	g := NewGroup("test-switch-cooldown", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-switch-cooldown", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		return []byte("ok"), nil
 	}), WithSwitchCooldown(150*time.Millisecond), WithFallbackTTL(time.Second))
 
@@ -516,7 +517,7 @@ func TestSwitchRespectsCooldown(t *testing.T) {
 }
 
 func TestAutoSwitchByMissRateHysteresis(t *testing.T) {
-	g := NewGroup("test-auto-switch-hysteresis", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-auto-switch-hysteresis", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		return []byte("ok"), nil
 	}),
 		WithSwitchCooldown(0),
@@ -571,7 +572,7 @@ func TestAutoSwitchByMissRateHysteresis(t *testing.T) {
 
 func TestConcurrentGetDuringSwitch(t *testing.T) {
 	var calls int32
-	g := NewGroup("test-concurrent-get-switch", 1<<20, GetterFunc(func(key string) ([]byte, error) {
+	g := NewGroup("test-concurrent-get-switch", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v-" + key), nil
 	}), WithFallbackTTL(time.Second), WithSwitchCooldown(0))
@@ -595,7 +596,7 @@ func TestConcurrentGetDuringSwitch(t *testing.T) {
 				}
 				key := keys[idx%len(keys)]
 				idx++
-				v, err := g.Get(key)
+				v, err := g.Get(context.Background(), key)
 				if err != nil {
 					select {
 					case errCh <- err:
@@ -630,5 +631,139 @@ func TestConcurrentGetDuringSwitch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("concurrent get during switch failed: %v", err)
 		}
+	}
+}
+
+func TestNegativeCacheCachesNotFound(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-negative-cache-hit", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, ErrNotFound
+	}), WithNegativeCache(200*time.Millisecond))
+
+	_, err := g.Get(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("first get should return ErrNotFound: %v", err)
+	}
+
+	_, err = g.Get(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second get should return ErrNotFound: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("getter should be called once within negative ttl: got %d", got)
+	}
+}
+
+func TestNegativeCacheExpires(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-negative-cache-expire", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, ErrNotFound
+	}), WithNegativeCache(30*time.Millisecond))
+
+	_, err := g.Get(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("first get should return ErrNotFound: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	_, err = g.Get(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second get should return ErrNotFound: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("getter should be called again after negative ttl expires: got %d", got)
+	}
+}
+
+func TestNegativeCacheSingleflightConcurrentRequests(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-negative-cache-singleflight", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(40 * time.Millisecond)
+		return nil, ErrNotFound
+	}), WithNegativeCache(200*time.Millisecond))
+
+	const workers = 16
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := g.Get(context.Background(), "missing")
+			if !errors.Is(err, ErrNotFound) {
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unexpected concurrent get error: %v", err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("getter should be called once for concurrent not found requests: got %d", got)
+	}
+}
+
+func TestGroupGetHonorsCanceledContextBeforeLoad(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-context-canceled-before-load", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("value"), nil
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := g.Get(ctx, "Tom")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("getter should not be called after context cancel: got %d", got)
+	}
+}
+
+func TestGroupGetDoesNotShareCallerCancellationAcrossSingleflight(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-context-isolated-singleflight", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(40 * time.Millisecond)
+		return []byte("value"), nil
+	}), WithSingleflightWaitTTL(200*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		_, err := g.Get(ctx, "Tom")
+		firstErrCh <- err
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	v, err := g.Get(context.Background(), "Tom")
+	if err != nil {
+		t.Fatalf("second get should succeed after first caller cancels: %v", err)
+	}
+	if got := v.String(); got != "value" {
+		t.Fatalf("unexpected value after shared load: got %q, want value", got)
+	}
+
+	if err := <-firstErrCh; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first get should see context deadline exceeded, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("getter should be called once for shared load: got %d", got)
 	}
 }

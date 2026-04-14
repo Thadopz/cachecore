@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"goCache/singleflight"
 	"log"
@@ -94,18 +96,27 @@ type Group struct {
 	// cacheTTLJitter adds random jitter in range [-cacheTTLJitter, +cacheTTLJitter]
 	// to avoid synchronized expirations.
 	cacheTTLJitter time.Duration
+
+	// negativeCacheEnabled controls whether ErrNotFound is cached for a short TTL.
+	negativeCacheEnabled bool
+
+	// negativeTTL is used when writing negative cache entries.
+	negativeTTL time.Duration
 }
 
 func (g *Group) Log(format string, v ...interface{}) {
 	log.Printf("[Group %s] %s", g.name, fmt.Sprintf(format, v...))
 }
 
-func (g *Group) Get(key string) (ByteView, error) {
+func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 	start := time.Now()
 	defer func() {
 		Stats.RecordGroupGetLatency(time.Since(start))
 	}()
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
@@ -114,6 +125,9 @@ func (g *Group) Get(key string) (ByteView, error) {
 	if active != nil {
 		if v, ok := active.get(key); ok {
 			Stats.IncCacheHits()
+			if v.isNotFound() {
+				return ByteView{}, ErrNotFound
+			}
 			return v, nil
 		}
 	}
@@ -123,11 +137,14 @@ func (g *Group) Get(key string) (ByteView, error) {
 			if g.shouldRefillFromFallback(v) {
 				g.tryRefillActiveFromFallback(key, v)
 			}
+			if v.isNotFound() {
+				return ByteView{}, ErrNotFound
+			}
 			return v, nil
 		}
 	}
 	Stats.IncCacheMisses()
-	return g.load(key)
+	return g.load(ctx, key)
 }
 
 func (g *Group) currentCaches() (active Cache, fallback Cache) {
@@ -147,17 +164,33 @@ func (g *Group) currentCaches() (active Cache, fallback Cache) {
 }
 
 // if mainCache doesn't have the key, it should return an error, so that the getter can fallback to getFromPeer
-func (g *Group) load(key string) (value ByteView, err error) {
+func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ByteView{}, err
+	}
+	loadCtx := context.WithoutCancel(ctx)
 	loadFn := func() (interface{}, error) {
 		if g.peers != nil {
 			if peer, ok := g.peers.PickPeer(key); ok {
-				if value, err := g.getFromPeer(peer, key); err == nil {
+				if value, err := g.getFromPeer(loadCtx, peer, key); err == nil {
 					return value, nil
+				} else if errors.Is(err, ErrNotFound) {
+					if g.negativeCacheEnabled && g.negativeTTL > 0 {
+						active, _ := g.currentCaches()
+						if active != nil {
+							negativeValue := g.stampActiveValue(nil).withNotFound()
+							active.addWithTTL(key, negativeValue, g.negativeTTL)
+						}
+					}
+					return ByteView{}, ErrNotFound
 				}
 				g.Log("Failed to get from peer %v: %v", peer, err)
 			}
 		}
-		return g.getLocally(key)
+		return g.getLocally(loadCtx, key)
 	}
 
 	if g.singleflightWaitTTL <= 0 {
@@ -179,9 +212,14 @@ func (g *Group) load(key string) (value ByteView, err error) {
 			return ByteView{}, res.Err
 		}
 		return res.Val.(ByteView), nil
+	case <-ctx.Done():
+		return ByteView{}, ctx.Err()
 	case <-timer.C:
 		if v, ok := g.degradeFromCaches(key); ok {
 			g.Log("singleflight wait timeout key=%s, fallback served", key)
+			if v.isNotFound() {
+				return ByteView{}, ErrNotFound
+			}
 			return v, nil
 		}
 		g.Log("singleflight wait timeout key=%s, no fallback", key)
@@ -209,28 +247,48 @@ func (g *Group) degradeFromCaches(key string) (ByteView, bool) {
 	return ByteView{}, false
 }
 
-func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (ByteView, error) {
 	Stats.IncPeerLoads()
 	request := &pb.Request{
 		Group: g.name,
 		Key:   key,
 	}
 	response := &pb.Response{}
-	err := peer.Get(request, response)
+	err := peer.Get(ctx, request, response)
 	if err != nil {
 		return ByteView{}, err
 	}
-	return ByteView{b: response.Value}, nil
+	value := g.stampActiveValue(cloneBytes(response.Value))
+	ttl := g.nextTTL()
+	active, _ := g.currentCaches()
+	if active != nil {
+		if ttl > 0 {
+			active.addWithTTL(key, value, ttl)
+		} else {
+			active.add(key, value)
+		}
+	}
+	if g.filter != nil {
+		g.filter.Add(key)
+	}
+	return value, nil
 }
 
 // if peer doesn't have the key, it should return an error, so that the getter can fallback to getLocally
-func (g *Group) getLocally(key string) (ByteView, error) {
+func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	if g.filter != nil && g.filterReady.Load() && !g.filter.Contains(key) {
 		Stats.IncFilterMisses()
 		return ByteView{}, fmt.Errorf("%w key %s not found in filter", ErrFilterNotFound, key)
 	}
-	bytes, err := g.getter.Get(key)
+	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
+		if g.negativeCacheEnabled && g.negativeTTL > 0 && errors.Is(err, ErrNotFound) {
+			active, _ := g.currentCaches()
+			if active != nil {
+				negativeValue := g.stampActiveValue(nil).withNotFound()
+				active.addWithTTL(key, negativeValue, g.negativeTTL)
+			}
+		}
 		return ByteView{}, err
 	}
 	Stats.IncLocalLoads()
@@ -268,8 +326,8 @@ func (g *Group) nextTTL() time.Duration {
 	return ttl
 }
 
-func (g *Group) getLocallyOnlyForWarmUp(key string) (ByteView, error) {
-	bytes, err := g.getter.Get(key)
+func (g *Group) getLocallyOnlyForWarmUp(ctx context.Context, key string) (ByteView, error) {
+	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
 		return ByteView{}, err
 	}
@@ -294,7 +352,7 @@ func (g *Group) Warmup(keys []string) {
 	}
 	mark := true
 	for _, key := range keys {
-		if _, err := g.getLocallyOnlyForWarmUp(key); err != nil {
+		if _, err := g.getLocallyOnlyForWarmUp(context.Background(), key); err != nil {
 			mark = false
 			g.Log("Failed to warmup key %s: %v", key, err)
 		}
@@ -307,6 +365,20 @@ func (g *Group) Warmup(keys []string) {
 
 func (g *Group) Invalidate(key string) {
 	g.markInvalidated(key)
+	g.invalidateLocal(key)
+	if g.peers == nil {
+		return
+	}
+	broadcaster, ok := g.peers.(PeerInvalidationBroadcaster)
+	if !ok {
+		return
+	}
+	if err := broadcaster.BroadcastInvalidate(&pb.Request{Group: g.name, Key: key}); err != nil {
+		g.Log("broadcast invalidate key=%s failed: %v", key, err)
+	}
+}
+
+func (g *Group) invalidateLocal(key string) {
 	active, fallback := g.currentCaches()
 	if active != nil {
 		active.remove(key)

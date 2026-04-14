@@ -78,6 +78,7 @@ type Response struct {
 	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
 	Code          int32                  `protobuf:"varint,2,opt,name=code,proto3" json:"code,omitempty"`
 	ErrMsg        string                 `protobuf:"bytes,3,opt,name=errMsg,proto3" json:"errMsg,omitempty"`
+	NotFound      bool                   `protobuf:"varint,4,opt,name=notFound,proto3" json:"notFound,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -133,6 +134,13 @@ func (x *Response) GetErrMsg() string {
 	return ""
 }
 
+func (x *Response) GetNotFound() bool {
+	if x != nil {
+		return x.NotFound
+	}
+	return false
+}
+
 var File_pb_proto protoreflect.FileDescriptor
 
 const file_pb_proto_rawDesc = "" +
@@ -140,11 +148,12 @@ const file_pb_proto_rawDesc = "" +
 	"\bpb.proto\x12\fgroupCachepb\"1\n" +
 	"\aRequest\x12\x14\n" +
 	"\x05group\x18\x01 \x01(\tR\x05group\x12\x10\n" +
-	"\x03key\x18\x02 \x01(\tR\x03key\"L\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\"h\n" +
 	"\bResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\x05R\x04code\x12\x16\n" +
-	"\x06errMsg\x18\x03 \x01(\tR\x06errMsg2B\n" +
+	"\x06errMsg\x18\x03 \x01(\tR\x06errMsg\x12\x1a\n" +
+	"\bnotFound\x18\x04 \x01(\bR\bnotFound2B\n" +
 	"\n" +
 	"GroupCache\x124\n" +
 	"\x03Get\x12\x15.groupCachepb.Request\x1a\x16.groupCachepb.ResponseB\x16Z\x14goCache/groupcachepbb\x06proto3"

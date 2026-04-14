@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"goCache/singleflight"
 	"sync"
@@ -8,13 +9,13 @@ import (
 )
 
 type Getter interface {
-	Get(key string) ([]byte, error)
+	Get(ctx context.Context, key string) ([]byte, error)
 }
 
-type GetterFunc func(key string) ([]byte, error)
+type GetterFunc func(ctx context.Context, key string) ([]byte, error)
 
-func (f GetterFunc) Get(key string) ([]byte, error) {
-	return f(key)
+func (f GetterFunc) Get(ctx context.Context, key string) ([]byte, error) {
+	return f(ctx, key)
 }
 
 type Filter interface {
@@ -55,29 +56,33 @@ type AutoSwitchPolicy struct {
 }
 
 var (
-	ErrFilterNotFound = errors.New("key not found in filter")
-	ErrSwitchCooldown = errors.New("cache mode switch is in cooldown")
+	ErrFilterNotFound          = errors.New("key not found in filter")
+	ErrNotFound                = errors.New("key not found")
+	ErrSwitchCooldown          = errors.New("cache mode switch is in cooldown")
 	ErrSingleflightWaitTimeout = errors.New("singleflight wait timeout")
-	mu                sync.RWMutex
-	groups            = make(map[string]*Group)
+	mu                         sync.RWMutex
+	groups                     = make(map[string]*Group)
 )
 
 type Options struct {
-	Filter         Filter
-	Janitor        *Janitor
-	onEvicted      func(key string, value ByteView)
-	cache          Cache
-	useShards      bool
-	shards         uint32
-	cacheTTL       time.Duration
-	ttlJitter      time.Duration
-	fallbackTTL    time.Duration
-	cooldown       time.Duration
-	loadWaitTTL    time.Duration
-	fallbackTTLSet bool
-	cooldownSet    bool
-	loadWaitTTLSet bool
-	autoPolicy     AutoSwitchPolicy
+	Filter               Filter
+	Janitor              *Janitor
+	onEvicted            func(key string, value ByteView)
+	cache                Cache
+	useShards            bool
+	shards               uint32
+	cacheTTL             time.Duration
+	ttlJitter            time.Duration
+	fallbackTTL          time.Duration
+	cooldown             time.Duration
+	loadWaitTTL          time.Duration
+	negativeTTL          time.Duration
+	fallbackTTLSet       bool
+	cooldownSet          bool
+	loadWaitTTLSet       bool
+	negativeTTLSet       bool
+	negativeCacheEnabled bool
+	autoPolicy           AutoSwitchPolicy
 }
 
 func WithFilter(filter Filter) Option {
@@ -147,6 +152,14 @@ func WithSingleflightWaitTTL(ttl time.Duration) Option {
 	}
 }
 
+func WithNegativeCache(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.negativeTTL = ttl
+		o.negativeTTLSet = true
+		o.negativeCacheEnabled = ttl > 0
+	}
+}
+
 func WithAutoSwitchByMissRate(policy AutoSwitchPolicy) Option {
 	return func(o *Options) {
 		o.autoPolicy = policy
@@ -207,23 +220,25 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
-		name:             name,
-		getter:           getter,
-		activeCache:      mainCache,
-		loader:           &singleflight.Group{},
-		singleflightWaitTTL: options.loadWaitTTL,
-		filter:           options.Filter,
-		janitor:          options.Janitor,
-		cacheTTL:         options.cacheTTL,
-		cacheTTLJitter:   options.ttlJitter,
-		mode:             mode,
-		fallbackTTL:      fallbackTTL,
-		switchCooldown:   cooldown,
-		cacheBytes:       cacheBytes,
-		onEvicted:        options.onEvicted,
-		shardCount:       shardCount,
-		autoSwitchPolicy: options.autoPolicy,
-		activeEpoch:      1,
+		name:                 name,
+		getter:               getter,
+		activeCache:          mainCache,
+		loader:               &singleflight.Group{},
+		singleflightWaitTTL:  options.loadWaitTTL,
+		negativeTTL:          options.negativeTTL,
+		negativeCacheEnabled: options.negativeCacheEnabled,
+		filter:               options.Filter,
+		janitor:              options.Janitor,
+		cacheTTL:             options.cacheTTL,
+		cacheTTLJitter:       options.ttlJitter,
+		mode:                 mode,
+		fallbackTTL:          fallbackTTL,
+		switchCooldown:       cooldown,
+		cacheBytes:           cacheBytes,
+		onEvicted:            options.onEvicted,
+		shardCount:           shardCount,
+		autoSwitchPolicy:     options.autoPolicy,
+		activeEpoch:          1,
 	}
 	if g.janitor != nil {
 		go g.janitor.Run(g)

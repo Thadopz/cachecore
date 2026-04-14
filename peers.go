@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	pb "goCache/groupcachepb"
 )
 
@@ -9,5 +10,13 @@ type PeerPicker interface {
 }
 
 type PeerGetter interface {
-	Get(in *pb.Request, out *pb.Response) error
+	Get(ctx context.Context, in *pb.Request, out *pb.Response) error
+}
+
+type PeerInvalidator interface {
+	Invalidate(in *pb.Request) error
+}
+
+type PeerInvalidationBroadcaster interface {
+	BroadcastInvalidate(in *pb.Request) error
 }

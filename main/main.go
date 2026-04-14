@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	groupcache "goCache"
 	"goCache/bloomfilter"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -50,17 +50,48 @@ func seedRedisNumericKeys() {
 	log.Printf("[Redis] seeded key0~key100")
 }
 
-func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchPolicy, switchInterval time.Duration, fallbackTTL time.Duration, switchCooldown time.Duration) *groupcache.Group {
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+func defaultWarmupKeys() []string {
+	keys := make([]string, 0, len(db)+101)
+	for key := range db {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for i := 0; i <= 100; i++ {
+		keys = append(keys, "key"+strconv.Itoa(i))
+	}
+	return keys
+}
+
+func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchPolicy, switchInterval time.Duration, fallbackTTL time.Duration, switchCooldown time.Duration, enableFilter bool, filterSize int, filterHashes int) *groupcache.Group {
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		log.Printf("[Redis] ping failed, fallback to db only: %v", err)
 	}
 
 	opts := []groupcache.Option{
-		groupcache.WithFilter(bloomfilter.New(1000, 6)),
 		groupcache.WithOnEvicted(func(key string, value groupcache.ByteView) {
 			log.Printf("[Cache] evicted key=%s", key)
 		}),
+	}
+	if enableFilter {
+		opts = append(opts, groupcache.WithFilter(bloomfilter.New(filterSize, filterHashes)))
 	}
 
 	if fallbackTTL >= 0 {
@@ -80,11 +111,14 @@ func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchP
 	}
 
 	g := groupcache.NewGroup("scores", 2<<10, groupcache.GetterFunc(
-		func(key string) ([]byte, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		func(ctx context.Context, key string) ([]byte, error) {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
 
-			if value, err := rdb.Get(ctx, key).Result(); err == nil {
+			if value, err := rdb.Get(redisCtx, key).Result(); err == nil {
 				return []byte(value), nil
 			} else if !errors.Is(err, redis.Nil) {
 				log.Printf("[Redis] GET failed for key=%s: %v", key, err)
@@ -92,12 +126,12 @@ func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchP
 
 			log.Println("[SlowDB] search key", key)
 			if v, ok := db[key]; ok {
-				if err := rdb.Set(ctx, key, v, 0).Err(); err != nil {
+				if err := rdb.Set(redisCtx, key, v, 0).Err(); err != nil {
 					log.Printf("[Redis] SET failed for key=%s: %v", key, err)
 				}
 				return []byte(v), nil
 			}
-			return nil, fmt.Errorf("%s not exist", key)
+			return nil, groupcache.ErrNotFound
 		}),
 		opts...,
 	)
@@ -123,26 +157,33 @@ func startCacheServer(addr string, addrs []string, gcache *groupcache.Group) {
 	log.Fatal(http.ListenAndServe(addr[7:], peers))
 }
 
-func startAPIServer(apiAddr string, gcache *groupcache.Group) {
-	http.Handle("/api", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			go func() {
-				groupcache.Stats.RecordAPILatency(time.Since(start))
-			}()
+func newAPIHandler(gcache *groupcache.Group) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		defer func() {
+			groupcache.Stats.RecordAPILatency(time.Since(start))
+		}()
 
-			key := r.URL.Query().Get("key")
-			view, err := gcache.Get(key)
-			groupcache.Stats.IncAPIRequests()
-			if err != nil {
-				groupcache.Stats.IncAPIErrors()
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+		groupcache.Stats.IncAPIRequests()
+		key := r.URL.Query().Get("key")
+		view, err := gcache.Get(r.Context(), key)
+		if err != nil {
+			if errors.Is(err, groupcache.ErrNotFound) || errors.Is(err, groupcache.ErrFilterNotFound) {
+				http.Error(w, err.Error(), http.StatusNotFound)
 				return
 			}
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Write(view.ByteSlice())
+			groupcache.Stats.IncAPIErrors()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-		}))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(view.ByteSlice())
+	})
+}
+
+func startAPIServer(apiAddr string, gcache *groupcache.Group) {
+	http.Handle("/api", newAPIHandler(gcache))
 	http.Handle("/debug/stats", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			snapshot := groupcache.Stats.Snapshot()
@@ -209,6 +250,10 @@ func main() {
 	var switchCooldown time.Duration
 	var mutexProfileFraction int
 	var blockProfileRate int
+	var enableFilter bool
+	var filterSize int
+	var filterHashes int
+	var warmupKeysCSV string
 	flag.IntVar(&port, "port", 8001, "Cache server port")
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.StringVar(&strategy, "strategy", "unsharded", "Cache strategy: unsharded | sharded | dynamic")
@@ -222,6 +267,10 @@ func main() {
 	flag.DurationVar(&switchCooldown, "switch-cooldown", 45*time.Second, "Minimum interval between two mode switches")
 	flag.IntVar(&mutexProfileFraction, "mutex-profile-fraction", 0, "runtime.SetMutexProfileFraction value; >0 enables mutex contention sampling")
 	flag.IntVar(&blockProfileRate, "block-profile-rate", 0, "runtime.SetBlockProfileRate value; >0 enables blocking event sampling")
+	flag.BoolVar(&enableFilter, "filter", false, "Enable bloom filter pre-check before calling the getter")
+	flag.IntVar(&filterSize, "filter-size", 1000, "Bloom filter bitset size when -filter is enabled")
+	flag.IntVar(&filterHashes, "filter-hashes", 6, "Bloom filter hash count when -filter is enabled")
+	flag.StringVar(&warmupKeysCSV, "warmup-keys", "", "Comma-separated keys used to warm up the filter when -filter is enabled")
 	flag.Parse()
 
 	if mutexProfileFraction > 0 {
@@ -252,9 +301,15 @@ func main() {
 		HighConsecutive: highConsecutive,
 		LowConsecutive:  lowConsecutive,
 	}
-	requestGroup := createGroup(strategy, shards, autoPolicy, switchInterval, fallbackTTL, switchCooldown)
-	log.Printf("[Config] strategy=%s shards=%d dynamic=%v miss_high=%.3f miss_low=%.3f interval=%s mutex_profile_fraction=%d block_profile_rate=%d", strategy, shards, autoPolicy.Enable, missHigh, missLow, switchInterval, mutexProfileFraction, blockProfileRate)
-	requestGroup.Warmup([]string{"Tom"})
+	requestGroup := createGroup(strategy, shards, autoPolicy, switchInterval, fallbackTTL, switchCooldown, enableFilter, filterSize, filterHashes)
+	warmupKeys := splitCSV(warmupKeysCSV)
+	if enableFilter && len(warmupKeys) == 0 {
+		warmupKeys = defaultWarmupKeys()
+	}
+	log.Printf("[Config] strategy=%s shards=%d dynamic=%v filter=%v filter_size=%d filter_hashes=%d warmup_keys=%d miss_high=%.3f miss_low=%.3f interval=%s mutex_profile_fraction=%d block_profile_rate=%d", strategy, shards, autoPolicy.Enable, enableFilter, filterSize, filterHashes, len(warmupKeys), missHigh, missLow, switchInterval, mutexProfileFraction, blockProfileRate)
+	if enableFilter {
+		requestGroup.Warmup(warmupKeys)
+	}
 	if api {
 		go startAPIServer(apiAddr, requestGroup)
 	}
