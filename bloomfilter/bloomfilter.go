@@ -41,7 +41,7 @@ func (bf *BloomFilter) Add(item string) {
 		return
 	}
 	for _, idx := range bf.indexes(item) {
-		bf.arr[idx]++
+		bf.arr[idx] = 1
 	}
 }
 
@@ -59,16 +59,11 @@ func (bf *BloomFilter) Contains(item string) bool {
 	return true
 }
 
-func (bf *BloomFilter) Remove(item string) {
+func (bf *BloomFilter) Reset() {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()
-	if len(bf.arr) == 0 {
-		return
-	}
-	for _, idx := range bf.indexes(item) {
-		if bf.arr[idx] > 0 {
-			bf.arr[idx]--
-		}
+	for i := range bf.arr {
+		bf.arr[i] = 0
 	}
 }
 

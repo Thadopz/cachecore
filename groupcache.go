@@ -22,51 +22,8 @@ type Group struct {
 	// It should return the data corresponding to the key.
 	getter Getter
 
-	// activeCache serves all new reads/writes.
-	activeCache Cache
-
-	// fallbackCache is the previous cache kept for a short grace window after switch.
-	fallbackCache Cache
-
-	// routeMu protects active/fallback cache swapping and mode metadata.
-	routeMu sync.RWMutex
-
-	// mode records current cache mode.
-	mode CacheMode
-
-	// switchedAt tracks when the last cache mode switch happened.
-	switchedAt time.Time
-
-	// fallbackTTL controls how long fallbackCache can serve misses.
-	fallbackTTL time.Duration
-
-	// switchCooldown prevents rapid mode flapping.
-	switchCooldown time.Duration
-
-	// cacheBytes is the target capacity for newly created cache instance.
-	cacheBytes int64
-
-	// onEvicted callback is reused when creating new cache instances.
-	onEvicted func(key string, value ByteView)
-
-	// shardCount is used when switching to sharded mode.
-	shardCount uint32
-
-	// autoSwitchPolicy controls threshold-based dynamic switching.
-	autoSwitchPolicy AutoSwitchPolicy
-
-	// highStreak/lowStreak count consecutive intervals that satisfy thresholds.
-	highStreak int
-	lowStreak  int
-
-	// activeEpoch labels the current cache generation.
-	activeEpoch uint64
-
-	// fallbackEpoch labels the previous cache generation during a grace window.
-	fallbackEpoch uint64
-
-	// controllerStop stops the background auto switch controller.
-	controllerStop chan struct{}
+	// router owns active/fallback cache state and mode switching.
+	router *cacheRouter
 
 	// peers is used to pick a peer to get the value for a key.
 	// It is set by RegisterPeers and should not be nil after that.
@@ -85,6 +42,12 @@ type Group struct {
 	// it is optional and can be nil if not needed.
 	filter      Filter
 	filterReady atomic.Bool
+
+	filterMu          sync.RWMutex
+	filterWarmupMu    sync.Mutex
+	filterWarmupKeys  []string
+	filterRefresh     time.Duration
+	filterRefreshStop chan struct{}
 
 	// janitor is used to periodically clean up expired items from the cache.
 	// it is optional and can be nil if not needed.
@@ -148,19 +111,7 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 }
 
 func (g *Group) currentCaches() (active Cache, fallback Cache) {
-	g.routeMu.RLock()
-	defer g.routeMu.RUnlock()
-	active = g.activeCache
-	if g.fallbackCache == nil {
-		return active, nil
-	}
-	if g.fallbackTTL <= 0 {
-		return active, nil
-	}
-	if g.fallbackTTL > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) > g.fallbackTTL {
-		return active, nil
-	}
-	return active, g.fallbackCache
+	return g.router.currentCaches()
 }
 
 // if mainCache doesn't have the key, it should return an error, so that the getter can fallback to getFromPeer
@@ -276,7 +227,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 
 // if peer doesn't have the key, it should return an error, so that the getter can fallback to getLocally
 func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
-	if g.filter != nil && g.filterReady.Load() && !g.filter.Contains(key) {
+	if g.filterRejects(key) {
 		Stats.IncFilterMisses()
 		return ByteView{}, fmt.Errorf("%w key %s not found in filter", ErrFilterNotFound, key)
 	}
@@ -307,6 +258,15 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 		g.filter.Add(key)
 	}
 	return value, nil
+}
+
+func (g *Group) filterRejects(key string) bool {
+	if g.filter == nil {
+		return false
+	}
+	g.filterMu.RLock()
+	defer g.filterMu.RUnlock()
+	return g.filterReady.Load() && !g.filter.Contains(key)
 }
 
 func (g *Group) nextTTL() time.Duration {
@@ -350,6 +310,7 @@ func (g *Group) Warmup(keys []string) {
 		g.Log("No filter set, skipping warmup")
 		return
 	}
+	keys = cloneStrings(keys)
 	mark := true
 	for _, key := range keys {
 		if _, err := g.getLocallyOnlyForWarmUp(context.Background(), key); err != nil {
@@ -358,13 +319,15 @@ func (g *Group) Warmup(keys []string) {
 		}
 	}
 	if mark {
+		g.filterWarmupMu.Lock()
+		g.filterWarmupKeys = keys
+		g.filterWarmupMu.Unlock()
 		g.filterReady.Store(true)
 		g.Log("Warmup completed successfully")
 	}
 }
 
 func (g *Group) Invalidate(key string) {
-	g.markInvalidated(key)
 	g.invalidateLocal(key)
 	if g.peers == nil {
 		return
@@ -386,7 +349,11 @@ func (g *Group) invalidateLocal(key string) {
 	if fallback != nil {
 		fallback.remove(key)
 	}
-	if g.filter != nil {
-		g.filter.Remove(key)
+}
+
+func cloneStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
 	}
+	return append([]string(nil), values...)
 }

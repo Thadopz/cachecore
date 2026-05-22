@@ -64,12 +64,19 @@ type Metrics struct {
 	SwitchToUnsharded     uint64
 	SwitchSkippedCooldown uint64
 
-	apiLatencyWindow      latencyWindow
-	groupGetLatencyWindow latencyWindow
-	cacheGetLatencyWindow latencyWindow
+	latencySamplingEnabled atomic.Bool
+	apiLatencyWindow       latencyWindow
+	groupGetLatencyWindow  latencyWindow
+	cacheGetLatencyWindow  latencyWindow
 }
 
-var Stats = &Metrics{}
+var Stats = newMetrics()
+
+func newMetrics() *Metrics {
+	m := &Metrics{}
+	m.latencySamplingEnabled.Store(true)
+	return m
+}
 
 type latencyWindow struct {
 	mu      sync.Mutex
@@ -177,7 +184,9 @@ func (m *Metrics) RecordAPILatency(d time.Duration) {
 	us := uint64(d / time.Microsecond)
 	atomic.AddUint64(&m.APILatencyCount, 1)
 	atomic.AddUint64(&m.APILatencyTotalMicros, us)
-	m.apiLatencyWindow.observe(us)
+	if m.latencySamplingEnabled.Load() {
+		m.apiLatencyWindow.observe(us)
+	}
 }
 
 func (m *Metrics) IncGroupGets() {
@@ -191,7 +200,9 @@ func (m *Metrics) RecordGroupGetLatency(d time.Duration) {
 	us := uint64(d / time.Microsecond)
 	atomic.AddUint64(&m.GroupGetLatencyCount, 1)
 	atomic.AddUint64(&m.GroupGetTotalMicros, us)
-	m.groupGetLatencyWindow.observe(us)
+	if m.latencySamplingEnabled.Load() {
+		m.groupGetLatencyWindow.observe(us)
+	}
 }
 
 func (m *Metrics) IncCacheHits() {
@@ -209,7 +220,13 @@ func (m *Metrics) RecordCacheGetLatency(d time.Duration) {
 	us := uint64(d / time.Microsecond)
 	atomic.AddUint64(&m.CacheGetLatencyCount, 1)
 	atomic.AddUint64(&m.CacheGetTotalMicros, us)
-	m.cacheGetLatencyWindow.observe(us)
+	if m.latencySamplingEnabled.Load() {
+		m.cacheGetLatencyWindow.observe(us)
+	}
+}
+
+func (m *Metrics) SetLatencySamplingEnabled(enabled bool) {
+	m.latencySamplingEnabled.Store(enabled)
 }
 
 func (m *Metrics) IncPeerLoads() {

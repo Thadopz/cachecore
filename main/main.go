@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"runtime"
 	"slices"
 	"strconv"
@@ -25,8 +26,8 @@ var db = map[string]string{
 	"Sam":  "567",
 }
 
-func seedRedisNumericKeys() {
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+func seedRedisNumericKeys(redisAddr string) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -79,8 +80,26 @@ func defaultWarmupKeys() []string {
 	return keys
 }
 
-func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchPolicy, switchInterval time.Duration, fallbackTTL time.Duration, switchCooldown time.Duration, enableFilter bool, filterSize int, filterHashes int) *groupcache.Group {
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+func newWindowMissRateSampler(snapshot func() groupcache.MetricsSnapshot) func() float64 {
+	prev := snapshot()
+	return func() float64 {
+		current := snapshot()
+		deltaGets := current.GroupGets - prev.GroupGets
+		deltaMisses := current.CacheMisses - prev.CacheMisses
+		prev = current
+
+		if deltaGets == 0 {
+			return -1
+		}
+		if deltaMisses > deltaGets {
+			deltaMisses = deltaGets
+		}
+		return float64(deltaMisses) / float64(deltaGets)
+	}
+}
+
+func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchPolicy, switchInterval time.Duration, fallbackTTL time.Duration, switchCooldown time.Duration, enableFilter bool, filterSize int, filterHashes int, filterRefresh time.Duration, redisAddr string) *groupcache.Group {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		log.Printf("[Redis] ping failed, fallback to db only: %v", err)
 	}
@@ -92,6 +111,9 @@ func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchP
 	}
 	if enableFilter {
 		opts = append(opts, groupcache.WithFilter(bloomfilter.New(filterSize, filterHashes)))
+		if filterRefresh > 0 {
+			opts = append(opts, groupcache.WithFilterRefresh(filterRefresh))
+		}
 	}
 
 	if fallbackTTL >= 0 {
@@ -107,7 +129,7 @@ func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchP
 	case "dynamic":
 		opts = append(opts, groupcache.WithAutoSwitchByMissRate(autoPolicy))
 	default:
-		// unsharded is default; no extra option required.
+		// unsharded requires no extra option.
 	}
 
 	g := groupcache.NewGroup("scores", 2<<10, groupcache.GetterFunc(
@@ -137,13 +159,7 @@ func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchP
 	)
 
 	if strings.EqualFold(strategy, "dynamic") {
-		g.StartAutoSwitchController(switchInterval, func() float64 {
-			s := groupcache.Stats.Snapshot()
-			if s.GroupGets == 0 {
-				return 0
-			}
-			return float64(s.CacheMisses) / float64(s.GroupGets)
-		})
+		g.StartAutoSwitchController(switchInterval, newWindowMissRateSampler(groupcache.Stats.Snapshot))
 	}
 
 	return g
@@ -154,7 +170,41 @@ func startCacheServer(addr string, addrs []string, gcache *groupcache.Group) {
 	peers.Set(addrs...)
 	gcache.RegisterPeers(peers)
 	log.Println("cache is running at", addr)
-	log.Fatal(http.ListenAndServe(addr[7:], peers))
+	log.Fatal(http.ListenAndServe(listenAddrFromHTTPAddr(addr), peers))
+}
+
+func normalizeHTTPAddr(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		return "http://" + strings.TrimPrefix(strings.TrimPrefix(raw, "http://"), "https://")
+	}
+	return "http://" + raw
+}
+
+func parsePeerAddrs(csv string) []string {
+	parts := splitCSV(csv)
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		normalized := normalizeHTTPAddr(part)
+		if normalized != "" {
+			out = append(out, normalized)
+		}
+	}
+	return out
+}
+
+func listenAddrFromHTTPAddr(httpAddr string) string {
+	u, err := url.Parse(httpAddr)
+	if err != nil || u.Host == "" {
+		return httpAddr
+	}
+	return u.Host
 }
 
 func newAPIHandler(gcache *groupcache.Group) http.Handler {
@@ -232,7 +282,7 @@ func startAPIServer(apiAddr string, gcache *groupcache.Group) {
 			}
 		}))
 	log.Println("frontend server is running at", apiAddr)
-	log.Fatal(http.ListenAndServe(apiAddr[7:], nil))
+	log.Fatal(http.ListenAndServe(listenAddrFromHTTPAddr(apiAddr), nil))
 
 }
 
@@ -253,23 +303,33 @@ func main() {
 	var enableFilter bool
 	var filterSize int
 	var filterHashes int
+	var filterRefresh time.Duration
 	var warmupKeysCSV string
+	var selfAddr string
+	var peersCSV string
+	var redisAddr string
+	var apiAddr string
 	flag.IntVar(&port, "port", 8001, "Cache server port")
 	flag.BoolVar(&api, "api", false, "Start a api server?")
-	flag.StringVar(&strategy, "strategy", "unsharded", "Cache strategy: unsharded | sharded | dynamic")
+	flag.StringVar(&apiAddr, "api-addr", "0.0.0.0:9999", "API server listen address")
+	flag.StringVar(&selfAddr, "self-addr", "", "Current node HTTP address for peer routing, e.g. http://cache-0.cache:8001")
+	flag.StringVar(&peersCSV, "peers", "", "Comma-separated peer HTTP addresses; defaults to local demo addresses when empty")
+	flag.StringVar(&redisAddr, "redis-addr", "127.0.0.1:6379", "Redis address host:port")
+	flag.StringVar(&strategy, "strategy", "sharded", "Cache strategy: sharded | unsharded | dynamic (experimental)")
 	flag.UintVar(&shards, "shards", 256, "Shard count when using sharded or dynamic strategy")
-	flag.DurationVar(&switchInterval, "switch-interval", 2*time.Second, "Auto switch evaluation interval in dynamic mode")
-	flag.Float64Var(&missHigh, "miss-high", 0.8, "High miss-rate threshold to switch to sharded in dynamic mode")
-	flag.Float64Var(&missLow, "miss-low", 0.55, "Low miss-rate threshold to switch to unsharded in dynamic mode")
-	flag.IntVar(&highConsecutive, "high-consecutive", 6, "Consecutive high miss-rate windows needed before switching to sharded")
-	flag.IntVar(&lowConsecutive, "low-consecutive", 8, "Consecutive low miss-rate windows needed before switching to unsharded")
-	flag.DurationVar(&fallbackTTL, "fallback-ttl", 90*time.Second, "Fallback cache TTL after mode switch")
-	flag.DurationVar(&switchCooldown, "switch-cooldown", 45*time.Second, "Minimum interval between two mode switches")
+	flag.DurationVar(&switchInterval, "switch-interval", 3*time.Second, "Auto switch evaluation interval in dynamic mode (experimental)")
+	flag.Float64Var(&missHigh, "miss-high", 0.45, "High miss-rate threshold to switch to sharded in dynamic mode (experimental)")
+	flag.Float64Var(&missLow, "miss-low", 0.08, "Low miss-rate threshold to switch to unsharded in dynamic mode (experimental)")
+	flag.IntVar(&highConsecutive, "high-consecutive", 3, "Consecutive high miss-rate windows needed before switching to sharded in dynamic mode (experimental)")
+	flag.IntVar(&lowConsecutive, "low-consecutive", 6, "Consecutive low miss-rate windows needed before switching to unsharded in dynamic mode (experimental)")
+	flag.DurationVar(&fallbackTTL, "fallback-ttl", 120*time.Second, "Fallback cache TTL after mode switch in dynamic mode (experimental)")
+	flag.DurationVar(&switchCooldown, "switch-cooldown", 90*time.Second, "Minimum interval between two mode switches in dynamic mode (experimental)")
 	flag.IntVar(&mutexProfileFraction, "mutex-profile-fraction", 0, "runtime.SetMutexProfileFraction value; >0 enables mutex contention sampling")
 	flag.IntVar(&blockProfileRate, "block-profile-rate", 0, "runtime.SetBlockProfileRate value; >0 enables blocking event sampling")
 	flag.BoolVar(&enableFilter, "filter", false, "Enable bloom filter pre-check before calling the getter")
 	flag.IntVar(&filterSize, "filter-size", 1000, "Bloom filter bitset size when -filter is enabled")
 	flag.IntVar(&filterHashes, "filter-hashes", 6, "Bloom filter hash count when -filter is enabled")
+	flag.DurationVar(&filterRefresh, "filter-refresh", 5*time.Minute, "Bloom filter refresh interval from warmup keys when -filter is enabled; <=0 disables refresh")
 	flag.StringVar(&warmupKeysCSV, "warmup-keys", "", "Comma-separated keys used to warm up the filter when -filter is enabled")
 	flag.Parse()
 
@@ -280,19 +340,34 @@ func main() {
 		runtime.SetBlockProfileRate(blockProfileRate)
 	}
 
-	apiAddr := "http://0.0.0.0:9999"
+	if selfAddr == "" {
+		selfAddr = "http://localhost:" + strconv.Itoa(port)
+	} else {
+		selfAddr = normalizeHTTPAddr(selfAddr)
+	}
+
+	if apiAddr == "" {
+		apiAddr = "0.0.0.0:9999"
+	}
+
 	addrMap := map[int]string{
 		8001: "http://localhost:8001",
 		8002: "http://localhost:8002",
 		8003: "http://localhost:8003",
 	}
 
-	var addrs []string
-	for _, v := range addrMap {
-		addrs = append(addrs, v)
+	addrs := parsePeerAddrs(peersCSV)
+	if len(addrs) == 0 {
+		for _, v := range addrMap {
+			addrs = append(addrs, v)
+		}
 	}
 
-	seedRedisNumericKeys()
+	if !slices.Contains(addrs, selfAddr) {
+		addrs = append(addrs, selfAddr)
+	}
+
+	seedRedisNumericKeys(redisAddr)
 
 	autoPolicy := groupcache.AutoSwitchPolicy{
 		Enable:          strings.EqualFold(strategy, "dynamic"),
@@ -301,18 +376,18 @@ func main() {
 		HighConsecutive: highConsecutive,
 		LowConsecutive:  lowConsecutive,
 	}
-	requestGroup := createGroup(strategy, shards, autoPolicy, switchInterval, fallbackTTL, switchCooldown, enableFilter, filterSize, filterHashes)
+	requestGroup := createGroup(strategy, shards, autoPolicy, switchInterval, fallbackTTL, switchCooldown, enableFilter, filterSize, filterHashes, filterRefresh, redisAddr)
 	warmupKeys := splitCSV(warmupKeysCSV)
 	if enableFilter && len(warmupKeys) == 0 {
 		warmupKeys = defaultWarmupKeys()
 	}
-	log.Printf("[Config] strategy=%s shards=%d dynamic=%v filter=%v filter_size=%d filter_hashes=%d warmup_keys=%d miss_high=%.3f miss_low=%.3f interval=%s mutex_profile_fraction=%d block_profile_rate=%d", strategy, shards, autoPolicy.Enable, enableFilter, filterSize, filterHashes, len(warmupKeys), missHigh, missLow, switchInterval, mutexProfileFraction, blockProfileRate)
+	log.Printf("[Config] strategy=%s shards=%d dynamic=%v filter=%v filter_size=%d filter_hashes=%d filter_refresh=%s warmup_keys=%d miss_high=%.3f miss_low=%.3f interval=%s mutex_profile_fraction=%d block_profile_rate=%d", strategy, shards, autoPolicy.Enable, enableFilter, filterSize, filterHashes, filterRefresh, len(warmupKeys), missHigh, missLow, switchInterval, mutexProfileFraction, blockProfileRate)
 	if enableFilter {
 		requestGroup.Warmup(warmupKeys)
 	}
 	if api {
-		go startAPIServer(apiAddr, requestGroup)
+		go startAPIServer("http://"+apiAddr, requestGroup)
 	}
 	go groupcache.Stats.StartLogger(time.Second * 5)
-	startCacheServer(addrMap[port], []string(addrs), requestGroup)
+	startCacheServer(selfAddr, addrs, requestGroup)
 }

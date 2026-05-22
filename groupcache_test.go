@@ -32,10 +32,10 @@ func (f *testFilter) Contains(item string) bool {
 	return ok
 }
 
-func (f *testFilter) Remove(item string) {
+func (f *testFilter) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.data, item)
+	f.data = make(map[string]struct{})
 }
 
 func TestGroupGetCachesHotKey(t *testing.T) {
@@ -323,6 +323,44 @@ func TestInvalidateRemovesMainCacheEntry(t *testing.T) {
 	}
 }
 
+func TestInvalidateKeepsFilterEntry(t *testing.T) {
+	filter := newTestFilter()
+	g := NewGroupWithFilter("test-invalidate-filter", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return []byte("value"), nil
+	}), filter)
+
+	g.Warmup([]string{"Tom"})
+	g.Invalidate("Tom")
+
+	if !filter.Contains("Tom") {
+		t.Fatalf("invalidation should not delete add-only filter entries")
+	}
+}
+
+func TestFilterRefreshRebuildsFromWarmupKeys(t *testing.T) {
+	filter := newTestFilter()
+	var calls int32
+	g := NewGroup("test-refresh-filter", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("value-" + key), nil
+	}), WithFilter(filter), WithFilterRefresh(25*time.Millisecond))
+	defer g.StopFilterRefresh()
+
+	g.Warmup([]string{"Tom"})
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&calls) >= 2 && g.filterReady.Load() && filter.Contains("Tom") {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&calls); got < 2 {
+		t.Fatalf("filter refresh should rerun warmup getters, got %d calls", got)
+	}
+	t.Fatalf("filter refresh did not publish a ready rebuild for warmup keys")
+}
+
 func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
 	var calls int32
 	g := NewGroup("test-switch-fallback-refill", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
@@ -355,9 +393,9 @@ func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
 		t.Fatalf("fallback read should not call getter again: got %d, want 1", got)
 	}
 
-	g.routeMu.RLock()
-	active := g.activeCache
-	g.routeMu.RUnlock()
+	g.router.mu.RLock()
+	active := g.router.active
+	g.router.mu.RUnlock()
 	if active == nil {
 		t.Fatalf("active cache should exist")
 	}
@@ -381,9 +419,9 @@ func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
 	}
 
 	// Simulate a newer cache generation so the fallback entry epoch becomes stale.
-	g.routeMu.Lock()
-	g.fallbackEpoch++
-	g.routeMu.Unlock()
+	g.router.mu.Lock()
+	g.router.fallbackEpoch++
+	g.router.mu.Unlock()
 
 	v, err := g.Get(context.Background(), "Tom")
 	if err != nil {
@@ -393,9 +431,9 @@ func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
 		t.Fatalf("unexpected value from fallback: got %s, want v-Tom", got)
 	}
 
-	g.routeMu.RLock()
-	active := g.activeCache
-	g.routeMu.RUnlock()
+	g.router.mu.RLock()
+	active := g.router.active
+	g.router.mu.RUnlock()
 	if active == nil {
 		t.Fatalf("active cache should exist")
 	}
@@ -438,8 +476,8 @@ func TestFallbackTTLZeroNeverServesFallback(t *testing.T) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("v"), nil
 	}), WithFallbackTTL(0), WithSwitchCooldown(0))
-	if g.fallbackTTL != 0 {
-		t.Fatalf("unexpected fallbackTTL: got %v, want 0", g.fallbackTTL)
+	if g.router.fallbackTTL != 0 {
+		t.Fatalf("unexpected fallbackTTL: got %v, want 0", g.router.fallbackTTL)
 	}
 	if mode := g.Mode(); mode != CacheModeUnsharded {
 		t.Fatalf("unexpected initial mode: got %v, want unsharded", mode)

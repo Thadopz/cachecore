@@ -9,37 +9,11 @@ type ShardedCache struct {
 }
 
 func djb33(seed uint32, k string) uint32 {
-	var (
-		l = uint32(len(k))
-		d = 5381 + seed + l
-		i = uint32(0)
-	)
-	if l >= 4 {
-		for i < l-4 {
-			d = (d * 33) ^ uint32(k[i])
-			d = (d * 33) ^ uint32(k[i+1])
-			d = (d * 33) ^ uint32(k[i+2])
-			d = (d * 33) ^ uint32(k[i+3])
-			i += 4
-		}
-	}
-	switch l - i {
-	case 1:
-	case 2:
+	d := uint32(5381) + seed + uint32(len(k))
+	for i := 0; i < len(k); i++ {
 		d = (d * 33) ^ uint32(k[i])
-	case 3:
-		d = (d * 33) ^ uint32(k[i])
-		d = (d * 33) ^ uint32(k[i+1])
-	case 4:
-		d = (d * 33) ^ uint32(k[i])
-		d = (d * 33) ^ uint32(k[i+1])
-		d = (d * 33) ^ uint32(k[i+2])
 	}
 	return d ^ (d >> 16)
-}
-
-func defaultShardedCache(cacheBytes int64, onEvicted onEvictedFunc) *ShardedCache {
-	return newShardedCache(0, 256, cacheBytes, onEvicted)
 }
 
 func newShardedCache(seed uint32, m uint32, cacheBytes int64, onEvicted onEvictedFunc) *ShardedCache {

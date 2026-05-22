@@ -335,6 +335,7 @@ func TestInvalidateBroadcastRemovesPeerEntry(t *testing.T) {
 
 	localGroup := &Group{
 		name:   groupName,
+		router: newCacheRouter(&cache{cacheBytes: 1 << 20}, CacheModeUnsharded, 90*time.Second, 30*time.Second, 1<<20, nil, 256, AutoSwitchPolicy{}),
 		peers:  localPool,
 		loader: &singleflight.Group{},
 	}

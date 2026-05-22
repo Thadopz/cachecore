@@ -1,56 +1,112 @@
 package cache
 
 import (
+	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-func (g *Group) Mode() CacheMode {
-	g.routeMu.RLock()
-	defer g.routeMu.RUnlock()
-	return g.mode
+type cacheRouter struct {
+	mu sync.RWMutex
+
+	active   Cache
+	fallback Cache
+	mode     CacheMode
+
+	switchedAt     time.Time
+	fallbackTTL    time.Duration
+	switchCooldown time.Duration
+
+	cacheBytes int64
+	onEvicted  onEvictedFunc
+	shardCount uint32
+
+	autoSwitchPolicy AutoSwitchPolicy
+	highStreak       int
+	lowStreak        int
+
+	activeEpoch   uint64
+	fallbackEpoch uint64
+
+	controllerStop chan struct{}
 }
 
-func (g *Group) SwitchToSharded(shards uint32) error {
-	if g.Mode() == CacheModeSharded {
+func newCacheRouter(active Cache, mode CacheMode, fallbackTTL, switchCooldown time.Duration, cacheBytes int64, onEvicted onEvictedFunc, shardCount uint32, autoPolicy AutoSwitchPolicy) *cacheRouter {
+	if shardCount == 0 {
+		shardCount = 256
+	}
+	return &cacheRouter{
+		active:           active,
+		mode:             mode,
+		fallbackTTL:      fallbackTTL,
+		switchCooldown:   switchCooldown,
+		cacheBytes:       cacheBytes,
+		onEvicted:        onEvicted,
+		shardCount:       shardCount,
+		autoSwitchPolicy: autoPolicy,
+		activeEpoch:      1,
+	}
+}
+
+func (r *cacheRouter) currentCaches() (active Cache, fallback Cache) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	active = r.active
+	if r.fallback == nil {
+		return active, nil
+	}
+	if r.fallbackTTL <= 0 {
+		return active, nil
+	}
+	if !r.switchedAt.IsZero() && time.Since(r.switchedAt) > r.fallbackTTL {
+		return active, nil
+	}
+	return active, r.fallback
+}
+
+func (r *cacheRouter) modeSnapshot() CacheMode {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mode
+}
+
+func (r *cacheRouter) switchToSharded(shards uint32) error {
+	if r.modeSnapshot() == CacheModeSharded {
 		return nil
 	}
 	if shards == 0 {
-		shards = atomic.LoadUint32(&g.shardCount)
+		shards = atomic.LoadUint32(&r.shardCount)
 		if shards == 0 {
 			shards = 256
 		}
 	}
-	atomic.StoreUint32(&g.shardCount, shards)
-	perShardBytes := g.cacheBytes / int64(shards)
-	if perShardBytes <= 0 {
-		perShardBytes = 1
-	}
-	newCache := newShardedCache(0, shards, perShardBytes, g.onEvicted)
-	return g.switchTo(newCache, CacheModeSharded)
+	atomic.StoreUint32(&r.shardCount, shards)
+	newCache := newShardedCache(0, shards, r.perShardBytes(shards), r.onEvicted)
+	return r.switchTo(newCache, CacheModeSharded)
 }
 
-func (g *Group) SwitchToUnsharded() error {
-	if g.Mode() == CacheModeUnsharded {
+func (r *cacheRouter) switchToUnsharded() error {
+	if r.modeSnapshot() == CacheModeUnsharded {
 		return nil
 	}
-	newCache := &cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}
-	return g.switchTo(newCache, CacheModeUnsharded)
+	newCache := &cache{cacheBytes: r.cacheBytes, onEvicted: r.onEvicted}
+	return r.switchTo(newCache, CacheModeUnsharded)
 }
 
-func (g *Group) switchTo(newCache Cache, mode CacheMode) error {
-	g.routeMu.Lock()
-	defer g.routeMu.Unlock()
+func (r *cacheRouter) switchTo(newCache Cache, mode CacheMode) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	if g.mode == mode {
+	if r.mode == mode {
 		return nil
 	}
-	if g.switchCooldown > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) < g.switchCooldown {
+	if r.inCooldownLocked() {
 		Stats.IncSwitchSkippedCooldown()
 		return ErrSwitchCooldown
 	}
 
-	g.applySwitchLocked(newCache, mode)
+	r.applySwitchLocked(newCache, mode)
 	if mode == CacheModeSharded {
 		Stats.IncSwitchToSharded()
 	} else {
@@ -59,11 +115,15 @@ func (g *Group) switchTo(newCache Cache, mode CacheMode) error {
 	return nil
 }
 
-func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
-	g.routeMu.Lock()
-	defer g.routeMu.Unlock()
+func (r *cacheRouter) evaluateAutoSwitchOnce(missRate float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	policy := g.autoSwitchPolicy
+	if missRate < 0 || math.IsNaN(missRate) || math.IsInf(missRate, 0) {
+		return nil
+	}
+
+	policy := r.autoSwitchPolicy
 	if !policy.Enable {
 		return nil
 	}
@@ -77,80 +137,88 @@ func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
 		policy.MissRateLow = policy.MissRateHigh
 	}
 
-	if g.mode == CacheModeUnsharded {
+	if r.mode == CacheModeUnsharded {
 		if missRate >= policy.MissRateHigh {
-			g.highStreak++
+			r.highStreak++
 		} else {
-			g.highStreak = 0
+			r.highStreak = 0
 		}
-		g.lowStreak = 0
-		if g.highStreak < policy.HighConsecutive {
+		r.lowStreak = 0
+		if r.highStreak < policy.HighConsecutive {
 			return nil
 		}
-		if g.switchCooldown > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) < g.switchCooldown {
+		if r.inCooldownLocked() {
 			Stats.IncSwitchSkippedCooldown()
 			return ErrSwitchCooldown
 		}
 
-		shards := atomic.LoadUint32(&g.shardCount)
+		shards := atomic.LoadUint32(&r.shardCount)
 		if shards == 0 {
 			shards = 256
 		}
-		perShardBytes := g.cacheBytes / int64(shards)
-		if perShardBytes <= 0 {
-			perShardBytes = 1
-		}
-		g.applySwitchLocked(newShardedCache(0, shards, perShardBytes, g.onEvicted), CacheModeSharded)
+		r.applySwitchLocked(newShardedCache(0, shards, r.perShardBytes(shards), r.onEvicted), CacheModeSharded)
 		Stats.IncSwitchToSharded()
 		return nil
 	}
 
 	if missRate <= policy.MissRateLow {
-		g.lowStreak++
+		r.lowStreak++
 	} else {
-		g.lowStreak = 0
+		r.lowStreak = 0
 	}
-	g.highStreak = 0
-	if g.lowStreak < policy.LowConsecutive {
+	r.highStreak = 0
+	if r.lowStreak < policy.LowConsecutive {
 		return nil
 	}
-	if g.switchCooldown > 0 && !g.switchedAt.IsZero() && time.Since(g.switchedAt) < g.switchCooldown {
+	if r.inCooldownLocked() {
 		Stats.IncSwitchSkippedCooldown()
 		return ErrSwitchCooldown
 	}
 
-	g.applySwitchLocked(&cache{cacheBytes: g.cacheBytes, onEvicted: g.onEvicted}, CacheModeUnsharded)
+	r.applySwitchLocked(&cache{cacheBytes: r.cacheBytes, onEvicted: r.onEvicted}, CacheModeUnsharded)
 	Stats.IncSwitchToUnsharded()
 	return nil
 }
 
-func (g *Group) applySwitchLocked(newCache Cache, mode CacheMode) {
-	oldActive := g.activeCache
-	g.activeCache = newCache
-	g.fallbackCache = oldActive
-	g.fallbackEpoch = g.activeEpoch
-	g.activeEpoch++
-	if g.activeEpoch == 0 {
-		g.activeEpoch = 1
+func (r *cacheRouter) perShardBytes(shards uint32) int64 {
+	perShardBytes := r.cacheBytes / int64(shards)
+	if perShardBytes <= 0 {
+		return 1
 	}
-	g.mode = mode
-	g.switchedAt = time.Now()
-	g.highStreak = 0
-	g.lowStreak = 0
+	return perShardBytes
 }
 
-func (g *Group) StartAutoSwitchController(interval time.Duration, sampleMissRate func() float64) {
+func (r *cacheRouter) inCooldownLocked() bool {
+	return r.switchCooldown > 0 && !r.switchedAt.IsZero() && time.Since(r.switchedAt) < r.switchCooldown
+}
+
+func (r *cacheRouter) applySwitchLocked(newCache Cache, mode CacheMode) {
+	oldActive := r.active
+	r.active = newCache
+	r.fallback = oldActive
+	r.fallbackEpoch = r.activeEpoch
+	r.activeEpoch++
+	if r.activeEpoch == 0 {
+		r.activeEpoch = 1
+	}
+	r.mode = mode
+	r.switchedAt = time.Now()
+	r.highStreak = 0
+	r.lowStreak = 0
+}
+
+func (r *cacheRouter) startAutoSwitchController(interval time.Duration, sampleMissRate func() float64) {
 	if interval <= 0 || sampleMissRate == nil {
 		return
 	}
-	g.routeMu.Lock()
-	if g.controllerStop != nil {
-		g.routeMu.Unlock()
+	r.mu.Lock()
+	if r.controllerStop != nil {
+		r.mu.Unlock()
 		return
 	}
 	stop := make(chan struct{})
-	g.controllerStop = stop
-	g.routeMu.Unlock()
+	r.controllerStop = stop
+	r.mu.Unlock()
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -158,8 +226,8 @@ func (g *Group) StartAutoSwitchController(interval time.Duration, sampleMissRate
 		for {
 			select {
 			case <-ticker.C:
-				_ = g.EvaluateAutoSwitchOnce(sampleMissRate())
-				g.CleanupFallback()
+				_ = r.evaluateAutoSwitchOnce(sampleMissRate())
+				r.cleanupFallback()
 			case <-stop:
 				return
 			}
@@ -167,28 +235,56 @@ func (g *Group) StartAutoSwitchController(interval time.Duration, sampleMissRate
 	}()
 }
 
-func (g *Group) StopAutoSwitchController() {
-	g.routeMu.Lock()
-	stop := g.controllerStop
-	g.controllerStop = nil
-	g.routeMu.Unlock()
+func (r *cacheRouter) stopAutoSwitchController() {
+	r.mu.Lock()
+	stop := r.controllerStop
+	r.controllerStop = nil
+	r.mu.Unlock()
 	if stop == nil {
 		return
 	}
 	close(stop)
 }
 
+func (r *cacheRouter) cleanupFallback() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fallback == nil {
+		return
+	}
+	if r.fallbackTTL <= 0 {
+		r.fallback = nil
+		return
+	}
+	if !r.switchedAt.IsZero() && time.Since(r.switchedAt) > r.fallbackTTL {
+		r.fallback = nil
+	}
+}
+
+func (g *Group) Mode() CacheMode {
+	return g.router.modeSnapshot()
+}
+
+func (g *Group) SwitchToSharded(shards uint32) error {
+	return g.router.switchToSharded(shards)
+}
+
+func (g *Group) SwitchToUnsharded() error {
+	return g.router.switchToUnsharded()
+}
+
+func (g *Group) EvaluateAutoSwitchOnce(missRate float64) error {
+	return g.router.evaluateAutoSwitchOnce(missRate)
+}
+
+func (g *Group) StartAutoSwitchController(interval time.Duration, sampleMissRate func() float64) {
+	g.router.startAutoSwitchController(interval, sampleMissRate)
+}
+
+func (g *Group) StopAutoSwitchController() {
+	g.router.stopAutoSwitchController()
+}
+
 func (g *Group) CleanupFallback() {
-	g.routeMu.Lock()
-	defer g.routeMu.Unlock()
-	if g.fallbackCache == nil {
-		return
-	}
-	if g.fallbackTTL <= 0 {
-		g.fallbackCache = nil
-		return
-	}
-	if !g.switchedAt.IsZero() && time.Since(g.switchedAt) > g.fallbackTTL {
-		g.fallbackCache = nil
-	}
+	g.router.cleanupFallback()
 }

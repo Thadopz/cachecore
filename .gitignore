@@ -1,11 +1,30 @@
-perf/test-logs/k6/*.log
-perf/test-logs/k6/*.json
-perf/test-logs/pprof/*.pb.gz
-test-logs/pprof/*.pb.gz
-test-logs/*.log
-test-logs/*.json
+# IDE / local workspace
 .vscode/*.json
 summary.md
+
+# Build outputs
 *.exe
-test-logs
+.gocache/
+$block
+$mutex
+
+# Generated test and benchmark artifacts
+test-logs/
+perf/test-logs/
+
+# Generated local perf outputs kept outside test-logs
+perf/*.exe
+perf/*.log
+perf/*.txt
+perf/scenario-*.log
+perf/dynamic-window*.log
+
+# Keep perf source scripts and checked-in reports
+!perf/README.md
+!perf/*.ps1
+!perf/*.js
+!perf/*.md
+!perf/*_test.go
+
+# Repo config
 .github

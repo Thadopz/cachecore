@@ -1,0 +1,7 @@
+.git
+.gitignore
+test-logs/
+perf/test-logs/
+*.exe
+*.log
+.vscode/

@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gocache
+  namespace: gocache
+spec:
+  clusterIP: None
+  selector:
+    app: go-cache
+  ports:
+    - name: peer
+      port: 8001
+      targetPort: 8001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gocache-api
+  namespace: gocache
+spec:
+  selector:
+    app: go-cache
+  ports:
+    - name: http
+      port: 9999
+      targetPort: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: go-cache
+  namespace: gocache
+spec:
+  serviceName: gocache
+  replicas: 3
+  selector:
+    matchLabels:
+      app: go-cache
+  template:
+    metadata:
+      labels:
+        app: go-cache
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: server
+          image: gocache:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          args:
+            - -port=8001
+            - -api=true
+            - -api-addr=0.0.0.0:9999
+            - -self-addr=http://$(POD_NAME).gocache.gocache.svc.cluster.local:8001
+            - -peers=http://go-cache-0.gocache.gocache.svc.cluster.local:8001,http://go-cache-1.gocache.gocache.svc.cluster.local:8001,http://go-cache-2.gocache.gocache.svc.cluster.local:8001
+            - -redis-addr=redis.gocache.svc.cluster.local:6379
+            - -strategy=sharded
+            - -shards=256
+          ports:
+            - name: peer
+              containerPort: 8001
+            - name: api
+              containerPort: 9999
+          readinessProbe:
+            httpGet:
+              path: /debug/stats
+              port: 9999
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /debug/stats
+              port: 9999
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

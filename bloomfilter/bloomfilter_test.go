@@ -46,6 +46,18 @@ func TestContainsNotAddedKey(t *testing.T) {
 	}
 }
 
+func TestResetClearsFilter(t *testing.T) {
+	bf := New(1000, 3)
+	bf.Add("Tom")
+	if !bf.Contains("Tom") {
+		t.Fatalf("expected item to be contained before reset")
+	}
+	bf.Reset()
+	if bf.Contains("Tom") {
+		t.Fatalf("expected reset to clear the filter")
+	}
+}
+
 func TestNewDefault(t *testing.T) {
 	bf := NewDefault()
 	if bf == nil {

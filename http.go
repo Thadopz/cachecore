@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 )
 
 const (
-	defaultBasePath = "/_goCache/"
-	defaultReplicas = 50
+	defaultBasePath       = "/_goCache/"
+	defaultReplicas       = 50
+	defaultRPCPath        = "/_goCache/get"
+	defaultInvalidatePath = "/_goCache/invalidate"
 )
 
 var defaultInvalidateTimeout = 2 * time.Second
@@ -71,17 +74,6 @@ func (p *HTTPPool) rpcPath(action string) string {
 	return p.basePath + action
 }
 
-func (p *HTTPPool) actionForPath(path string) (string, bool) {
-	switch path {
-	case p.rpcPath("get"):
-		return "get", true
-	case p.rpcPath("invalidate"):
-		return "invalidate", true
-	default:
-		return "", false
-	}
-}
-
 func writeProtoResponse(w http.ResponseWriter, code int32, errMsg string, value []byte, notFound bool) {
 	resp := &pb.Response{
 		Code:     code,
@@ -99,10 +91,26 @@ func writeProtoResponse(w http.ResponseWriter, code int32, errMsg string, value 
 	_, _ = w.Write(data)
 }
 
+func classifyPeerGetError(err error) (code int32, notFound bool) {
+	if err == nil {
+		return 0, false
+	}
+	if errors.Is(err, ErrNotFound) {
+		return http.StatusNotFound, true
+	}
+	if errors.Is(err, ErrFilterNotFound) {
+		return http.StatusNotFound, false
+	}
+	msg := err.Error()
+	if msg == ErrFilterNotFound.Error() || strings.Contains(msg, ErrFilterNotFound.Error()) {
+		return http.StatusNotFound, false
+	}
+	return http.StatusInternalServerError, false
+}
+
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	Stats.IncPeerHTTPRequests()
-	action, ok := p.actionForPath(r.URL.Path)
-	if !ok {
+	if r.URL.Path != defaultRPCPath && r.URL.Path != defaultInvalidatePath {
 		writeProtoResponse(w, http.StatusBadRequest, "bad request path", nil, false)
 		return
 	}
@@ -128,7 +136,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if action == "invalidate" {
+	if r.URL.Path == defaultInvalidatePath {
 		group.invalidateLocal(req.GetKey())
 		writeProtoResponse(w, 0, "", nil, false)
 		return
@@ -136,18 +144,13 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	view, err := group.Get(r.Context(), req.GetKey())
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeProtoResponse(w, http.StatusNotFound, err.Error(), nil, true)
-			return
-		}
-		if errors.Is(err, ErrFilterNotFound) {
-			writeProtoResponse(w, http.StatusNotFound, err.Error(), nil, false)
-			return
-		}
-		writeProtoResponse(w, http.StatusInternalServerError, err.Error(), nil, false)
+		code, notFound := classifyPeerGetError(err)
+		writeProtoResponse(w, code, err.Error(), nil, notFound)
+		return
+	} else {
+		writeProtoResponse(w, 0, "", view.ByteSlice(), false)
 		return
 	}
-	writeProtoResponse(w, 0, "", view.ByteSlice(), false)
 }
 
 type httpGetter struct {

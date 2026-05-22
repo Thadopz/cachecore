@@ -26,10 +26,12 @@ type Filter interface {
 	// It should return true if the item is probably in the filter,
 	// and false if it is definitely not in the filter.
 	Contains(item string) bool
+}
 
-	// Remove removes an item from the filter.
-	// It should ensure that the item is no longer considered to be in the filter.
-	Remove(item string)
+type ResettableFilter interface {
+	Filter
+	// Reset clears accumulated keys before a warmup-key rebuild.
+	Reset()
 }
 
 type Option func(*Options)
@@ -83,11 +85,18 @@ type Options struct {
 	negativeTTLSet       bool
 	negativeCacheEnabled bool
 	autoPolicy           AutoSwitchPolicy
+	filterRefresh        time.Duration
 }
 
 func WithFilter(filter Filter) Option {
 	return func(o *Options) {
 		o.Filter = filter
+	}
+}
+
+func WithFilterRefresh(interval time.Duration) Option {
+	return func(o *Options) {
+		o.filterRefresh = interval
 	}
 }
 
@@ -222,26 +231,22 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 	g := &Group{
 		name:                 name,
 		getter:               getter,
-		activeCache:          mainCache,
+		router:               newCacheRouter(mainCache, mode, fallbackTTL, cooldown, cacheBytes, options.onEvicted, shardCount, options.autoPolicy),
 		loader:               &singleflight.Group{},
 		singleflightWaitTTL:  options.loadWaitTTL,
 		negativeTTL:          options.negativeTTL,
 		negativeCacheEnabled: options.negativeCacheEnabled,
 		filter:               options.Filter,
+		filterRefresh:        options.filterRefresh,
 		janitor:              options.Janitor,
 		cacheTTL:             options.cacheTTL,
 		cacheTTLJitter:       options.ttlJitter,
-		mode:                 mode,
-		fallbackTTL:          fallbackTTL,
-		switchCooldown:       cooldown,
-		cacheBytes:           cacheBytes,
-		onEvicted:            options.onEvicted,
-		shardCount:           shardCount,
-		autoSwitchPolicy:     options.autoPolicy,
-		activeEpoch:          1,
 	}
 	if g.janitor != nil {
 		go g.janitor.Run(g)
+	}
+	if g.filterRefresh > 0 {
+		g.StartFilterRefresh(g.filterRefresh)
 	}
 	groups[name] = g
 	return g
