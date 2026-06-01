@@ -50,54 +50,12 @@ func (j *Janitor) Stop() {
 }
 
 func (g *Group) StartFilterRefresh(interval time.Duration) {
-	resettable, ok := g.filter.(ResettableFilter)
-	if !ok || interval <= 0 {
+	if g.filter == nil {
 		return
 	}
-
-	g.filterWarmupMu.Lock()
-	if g.filterRefreshStop != nil {
-		g.filterWarmupMu.Unlock()
-		return
-	}
-	stop := make(chan struct{})
-	g.filterRefreshStop = stop
-	g.filterWarmupMu.Unlock()
-
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				keys := g.filterKeysForRefresh()
-				if len(keys) == 0 {
-					continue
-				}
-				g.filterMu.Lock()
-				g.filterReady.Store(false)
-				resettable.Reset()
-				g.filterMu.Unlock()
-				g.Warmup(keys)
-			case <-stop:
-				return
-			}
-		}
-	}()
+	g.filter.startRefresh(interval, g.Warmup)
 }
 
 func (g *Group) StopFilterRefresh() {
-	g.filterWarmupMu.Lock()
-	stop := g.filterRefreshStop
-	g.filterRefreshStop = nil
-	g.filterWarmupMu.Unlock()
-	if stop != nil {
-		close(stop)
-	}
-}
-
-func (g *Group) filterKeysForRefresh() []string {
-	g.filterWarmupMu.Lock()
-	defer g.filterWarmupMu.Unlock()
-	return cloneStrings(g.filterWarmupKeys)
+	g.filter.stopRefresh()
 }

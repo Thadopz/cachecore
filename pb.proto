@@ -6,6 +6,7 @@ option go_package = "goCache/groupcachepb";
 message Request {
   string group = 1;
   string key = 2;
+  int64 delta = 3;
 }
 
 message Response {

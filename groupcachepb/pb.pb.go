@@ -25,6 +25,7 @@ type Request struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Group         string                 `protobuf:"bytes,1,opt,name=group,proto3" json:"group,omitempty"`
 	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Delta         int64                  `protobuf:"varint,3,opt,name=delta,proto3" json:"delta,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -71,6 +72,13 @@ func (x *Request) GetKey() string {
 		return x.Key
 	}
 	return ""
+}
+
+func (x *Request) GetDelta() int64 {
+	if x != nil {
+		return x.Delta
+	}
+	return 0
 }
 
 type Response struct {
@@ -145,10 +153,11 @@ var File_pb_proto protoreflect.FileDescriptor
 
 const file_pb_proto_rawDesc = "" +
 	"\n" +
-	"\bpb.proto\x12\fgroupCachepb\"1\n" +
+	"\bpb.proto\x12\fgroupCachepb\"G\n" +
 	"\aRequest\x12\x14\n" +
 	"\x05group\x18\x01 \x01(\tR\x05group\x12\x10\n" +
-	"\x03key\x18\x02 \x01(\tR\x03key\"h\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
+	"\x05delta\x18\x03 \x01(\x03R\x05delta\"h\n" +
 	"\bResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\x05R\x04code\x12\x16\n" +

@@ -45,6 +45,10 @@ func (sc *ShardedCache) get(key string) (value ByteView, ok bool) {
 	return sc.bucket(key).get(key)
 }
 
+func (sc *ShardedCache) increment(key string, delta int64, ttl time.Duration, makeValue func([]byte) ByteView) (int64, error) {
+	return sc.bucket(key).increment(key, delta, ttl, makeValue)
+}
+
 func (sc *ShardedCache) remove(key string) {
 	sc.bucket(key).remove(key)
 }

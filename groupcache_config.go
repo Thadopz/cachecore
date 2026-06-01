@@ -18,6 +18,16 @@ func (f GetterFunc) Get(ctx context.Context, key string) ([]byte, error) {
 	return f(ctx, key)
 }
 
+type Incrementer interface {
+	Increment(ctx context.Context, key string, delta int64) (int64, error)
+}
+
+type IncrementerFunc func(ctx context.Context, key string, delta int64) (int64, error)
+
+func (f IncrementerFunc) Increment(ctx context.Context, key string, delta int64) (int64, error) {
+	return f(ctx, key, delta)
+}
+
 type Filter interface {
 	// Add adds an item to the filter.
 	Add(item string)
@@ -60,6 +70,8 @@ type AutoSwitchPolicy struct {
 var (
 	ErrFilterNotFound          = errors.New("key not found in filter")
 	ErrNotFound                = errors.New("key not found")
+	ErrNonNumericValue         = errors.New("cache value is not numeric")
+	ErrIncrementUnsupported    = errors.New("peer does not support increment")
 	ErrSwitchCooldown          = errors.New("cache mode switch is in cooldown")
 	ErrSingleflightWaitTimeout = errors.New("singleflight wait timeout")
 	mu                         sync.RWMutex
@@ -68,6 +80,7 @@ var (
 
 type Options struct {
 	Filter               Filter
+	incrementer          Incrementer
 	Janitor              *Janitor
 	onEvicted            func(key string, value ByteView)
 	cache                Cache
@@ -97,6 +110,12 @@ func WithFilter(filter Filter) Option {
 func WithFilterRefresh(interval time.Duration) Option {
 	return func(o *Options) {
 		o.filterRefresh = interval
+	}
+}
+
+func WithIncrementer(incrementer Incrementer) Option {
+	return func(o *Options) {
+		o.incrementer = incrementer
 	}
 }
 
@@ -231,12 +250,14 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 	g := &Group{
 		name:                 name,
 		getter:               getter,
+		incrementer:          options.incrementer,
+		incrementLocks:       newStripedLocks(defaultIncrementLockStripes),
 		router:               newCacheRouter(mainCache, mode, fallbackTTL, cooldown, cacheBytes, options.onEvicted, shardCount, options.autoPolicy),
 		loader:               &singleflight.Group{},
 		singleflightWaitTTL:  options.loadWaitTTL,
 		negativeTTL:          options.negativeTTL,
 		negativeCacheEnabled: options.negativeCacheEnabled,
-		filter:               options.Filter,
+		filter:               newFilterGate(options.Filter),
 		filterRefresh:        options.filterRefresh,
 		janitor:              options.Janitor,
 		cacheTTL:             options.cacheTTL,

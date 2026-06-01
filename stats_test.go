@@ -1,6 +1,9 @@
 package cache
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestPercentileIndexNearestRank(t *testing.T) {
 	tests := []struct {
@@ -48,5 +51,62 @@ func TestLatencyWindowP95P99AndReset(t *testing.T) {
 	_, _, ok = w.p95p99AndReset()
 	if ok {
 		t.Fatalf("p95p99AndReset() after reset ok = true, want false")
+	}
+}
+
+func TestMetricsLatencySampleRateDisablesWindowSamplingOnly(t *testing.T) {
+	m := newMetrics()
+	m.SetLatencySampleRate(0)
+
+	for i := 0; i < 10; i++ {
+		m.RecordAPILatency(time.Millisecond)
+	}
+
+	snapshot := m.Snapshot()
+	if got, want := snapshot.APILatencyCount, uint64(10); got != want {
+		t.Fatalf("APILatencyCount = %d, want %d", got, want)
+	}
+	if got, want := snapshot.APILatencyTotalMicros, uint64(10000); got != want {
+		t.Fatalf("APILatencyTotalMicros = %d, want %d", got, want)
+	}
+	if _, _, ok := m.apiLatencyWindow.p95p99AndReset(); ok {
+		t.Fatalf("latency window should not receive samples when sample rate is 0")
+	}
+}
+
+func TestMetricsLatencySampleRateSamplesByInterval(t *testing.T) {
+	m := newMetrics()
+	m.SetLatencySampleRate(0.25)
+
+	for i := 0; i < 8; i++ {
+		m.RecordGroupGetLatency(time.Duration(i+1) * time.Millisecond)
+	}
+
+	p95, p99, ok := m.groupGetLatencyWindow.p95p99AndReset()
+	if !ok {
+		t.Fatalf("latency window should receive interval samples")
+	}
+	if got, want := p95, uint64(8000); got != want {
+		t.Fatalf("p95 = %d, want %d", got, want)
+	}
+	if got, want := p99, uint64(8000); got != want {
+		t.Fatalf("p99 = %d, want %d", got, want)
+	}
+}
+
+func TestMetricsLatencySampleRateOneSamplesAll(t *testing.T) {
+	m := newMetrics()
+	m.SetLatencySampleRate(1)
+
+	for i := 0; i < 3; i++ {
+		m.RecordCacheGetLatency(time.Duration(i+1) * time.Millisecond)
+	}
+
+	p95, _, ok := m.cacheGetLatencyWindow.p95p99AndReset()
+	if !ok {
+		t.Fatalf("latency window should receive samples")
+	}
+	if got, want := p95, uint64(3000); got != want {
+		t.Fatalf("p95 = %d, want %d", got, want)
 	}
 }

@@ -108,6 +108,14 @@ func createGroup(strategy string, shards uint, autoPolicy groupcache.AutoSwitchP
 		groupcache.WithOnEvicted(func(key string, value groupcache.ByteView) {
 			log.Printf("[Cache] evicted key=%s", key)
 		}),
+		groupcache.WithIncrementer(groupcache.IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+			return rdb.IncrBy(redisCtx, key, delta).Result()
+		})),
 	}
 	if enableFilter {
 		opts = append(opts, groupcache.WithFilter(bloomfilter.New(filterSize, filterHashes)))
@@ -215,6 +223,42 @@ func newAPIHandler(gcache *groupcache.Group) http.Handler {
 		}()
 
 		groupcache.Stats.IncAPIRequests()
+		if r.URL.Path == "/api/increment" {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			key := r.URL.Query().Get("key")
+			if key == "" {
+				http.Error(w, "key is required", http.StatusBadRequest)
+				return
+			}
+			delta := int64(1)
+			if raw := r.URL.Query().Get("delta"); raw != "" {
+				n, err := strconv.ParseInt(raw, 10, 64)
+				if err != nil {
+					http.Error(w, "delta must be an integer", http.StatusBadRequest)
+					return
+				}
+				delta = n
+			}
+			next, err := gcache.Increment(r.Context(), key, delta)
+			if err != nil {
+				if errors.Is(err, groupcache.ErrNonNumericValue) {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				groupcache.Stats.IncAPIErrors()
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{"key": key, "value": next}); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+
 		key := r.URL.Query().Get("key")
 		view, err := gcache.Get(r.Context(), key)
 		if err != nil {
@@ -233,7 +277,9 @@ func newAPIHandler(gcache *groupcache.Group) http.Handler {
 }
 
 func startAPIServer(apiAddr string, gcache *groupcache.Group) {
-	http.Handle("/api", newAPIHandler(gcache))
+	apiHandler := newAPIHandler(gcache)
+	http.Handle("/api", apiHandler)
+	http.Handle("/api/increment", apiHandler)
 	http.Handle("/debug/stats", http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			snapshot := groupcache.Stats.Snapshot()
@@ -300,6 +346,7 @@ func main() {
 	var switchCooldown time.Duration
 	var mutexProfileFraction int
 	var blockProfileRate int
+	var latencySampleRate float64
 	var enableFilter bool
 	var filterSize int
 	var filterHashes int
@@ -326,6 +373,7 @@ func main() {
 	flag.DurationVar(&switchCooldown, "switch-cooldown", 90*time.Second, "Minimum interval between two mode switches in dynamic mode (experimental)")
 	flag.IntVar(&mutexProfileFraction, "mutex-profile-fraction", 0, "runtime.SetMutexProfileFraction value; >0 enables mutex contention sampling")
 	flag.IntVar(&blockProfileRate, "block-profile-rate", 0, "runtime.SetBlockProfileRate value; >0 enables blocking event sampling")
+	flag.Float64Var(&latencySampleRate, "latency-sample-rate", 1.0, "Latency percentile sampling rate: 1=all, 0.01=1%, 0=disable percentile sampling")
 	flag.BoolVar(&enableFilter, "filter", false, "Enable bloom filter pre-check before calling the getter")
 	flag.IntVar(&filterSize, "filter-size", 1000, "Bloom filter bitset size when -filter is enabled")
 	flag.IntVar(&filterHashes, "filter-hashes", 6, "Bloom filter hash count when -filter is enabled")
@@ -339,6 +387,7 @@ func main() {
 	if blockProfileRate > 0 {
 		runtime.SetBlockProfileRate(blockProfileRate)
 	}
+	groupcache.Stats.SetLatencySampleRate(latencySampleRate)
 
 	if selfAddr == "" {
 		selfAddr = "http://localhost:" + strconv.Itoa(port)
@@ -381,7 +430,7 @@ func main() {
 	if enableFilter && len(warmupKeys) == 0 {
 		warmupKeys = defaultWarmupKeys()
 	}
-	log.Printf("[Config] strategy=%s shards=%d dynamic=%v filter=%v filter_size=%d filter_hashes=%d filter_refresh=%s warmup_keys=%d miss_high=%.3f miss_low=%.3f interval=%s mutex_profile_fraction=%d block_profile_rate=%d", strategy, shards, autoPolicy.Enable, enableFilter, filterSize, filterHashes, filterRefresh, len(warmupKeys), missHigh, missLow, switchInterval, mutexProfileFraction, blockProfileRate)
+	log.Printf("[Config] strategy=%s shards=%d dynamic=%v filter=%v filter_size=%d filter_hashes=%d filter_refresh=%s warmup_keys=%d miss_high=%.3f miss_low=%.3f interval=%s mutex_profile_fraction=%d block_profile_rate=%d latency_sample_rate=%.4f", strategy, shards, autoPolicy.Enable, enableFilter, filterSize, filterHashes, filterRefresh, len(warmupKeys), missHigh, missLow, switchInterval, mutexProfileFraction, blockProfileRate, latencySampleRate)
 	if enableFilter {
 		requestGroup.Warmup(warmupKeys)
 	}

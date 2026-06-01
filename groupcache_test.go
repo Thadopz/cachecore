@@ -69,6 +69,201 @@ func TestGroupGetCachesHotKey(t *testing.T) {
 	}
 }
 
+func TestGroupIncrementWithIncrementerUpdatesCache(t *testing.T) {
+	var counter int64 = 40
+	g := NewGroup("test-increment-backend", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, errors.New("getter should not be called after increment fills cache")
+	}), WithIncrementer(IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		if key != "counter" {
+			return 0, fmt.Errorf("unexpected key: %s", key)
+		}
+		return atomic.AddInt64(&counter, delta), nil
+	})))
+
+	next, err := g.Increment(context.Background(), "counter", 2)
+	if err != nil {
+		t.Fatalf("increment failed: %v", err)
+	}
+	if got, want := next, int64(42); got != want {
+		t.Fatalf("unexpected increment result: got %d, want %d", got, want)
+	}
+
+	view, err := g.Get(context.Background(), "counter")
+	if err != nil {
+		t.Fatalf("get after increment failed: %v", err)
+	}
+	if got, want := view.String(), "42"; got != want {
+		t.Fatalf("unexpected cached value: got %q, want %q", got, want)
+	}
+}
+
+func TestGroupIncrementCacheOnlyConcurrent(t *testing.T) {
+	g := NewGroup("test-increment-cache-only-concurrent", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, ErrNotFound
+	}))
+
+	const workers = 100
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := g.Increment(context.Background(), "counter", 1)
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("increment failed: %v", err)
+		}
+	}
+
+	view, err := g.Get(context.Background(), "counter")
+	if err != nil {
+		t.Fatalf("get after concurrent increment failed: %v", err)
+	}
+	if got, want := view.String(), "100"; got != want {
+		t.Fatalf("unexpected final value: got %q, want %q", got, want)
+	}
+}
+
+func TestGroupIncrementWithIncrementerSerializesSameKey(t *testing.T) {
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	var calls int32
+
+	g := NewGroup("test-increment-backend-same-key-serial", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, errors.New("getter should not be called")
+	}), WithIncrementer(IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			close(firstEntered)
+			<-releaseFirst
+			return 1, nil
+		}
+		close(secondEntered)
+		return 2, nil
+	})))
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := g.Increment(context.Background(), "counter", 1)
+		firstDone <- err
+	}()
+
+	<-firstEntered
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := g.Increment(context.Background(), "counter", 1)
+		secondDone <- err
+	}()
+
+	select {
+	case <-secondEntered:
+		t.Fatalf("same-key incrementer call should wait for the first call")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first increment failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second increment failed: %v", err)
+	}
+
+	view, err := g.Get(context.Background(), "counter")
+	if err != nil {
+		t.Fatalf("get after increments failed: %v", err)
+	}
+	if got, want := view.String(), "2"; got != want {
+		t.Fatalf("cache should keep newest increment value: got %q, want %q", got, want)
+	}
+}
+
+func TestGroupIncrementDifferentStripesRunInParallel(t *testing.T) {
+	blockedKey, fastKey := differentIncrementStripeKeys(t)
+	blockedEntered := make(chan struct{})
+	releaseBlocked := make(chan struct{})
+	fastEntered := make(chan struct{})
+
+	g := NewGroup("test-increment-backend-different-stripes", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, errors.New("getter should not be called")
+	}), WithIncrementer(IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		switch key {
+		case blockedKey:
+			close(blockedEntered)
+			<-releaseBlocked
+			return 1, nil
+		case fastKey:
+			close(fastEntered)
+			return 1, nil
+		default:
+			return 0, fmt.Errorf("unexpected key: %s", key)
+		}
+	})))
+
+	blockedDone := make(chan error, 1)
+	go func() {
+		_, err := g.Increment(context.Background(), blockedKey, 1)
+		blockedDone <- err
+	}()
+	<-blockedEntered
+
+	fastDone := make(chan error, 1)
+	go func() {
+		_, err := g.Increment(context.Background(), fastKey, 1)
+		fastDone <- err
+	}()
+
+	select {
+	case <-fastEntered:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("different-stripe increment should not wait for blocked key")
+	}
+	if err := <-fastDone; err != nil {
+		t.Fatalf("fast increment failed: %v", err)
+	}
+
+	close(releaseBlocked)
+	if err := <-blockedDone; err != nil {
+		t.Fatalf("blocked increment failed: %v", err)
+	}
+}
+
+func differentIncrementStripeKeys(t *testing.T) (string, string) {
+	t.Helper()
+	first := "counter-0"
+	firstStripe := djb33(0, first) % defaultIncrementLockStripes
+	for i := 1; i < 10000; i++ {
+		candidate := fmt.Sprintf("counter-%d", i)
+		if djb33(0, candidate)%defaultIncrementLockStripes != firstStripe {
+			return first, candidate
+		}
+	}
+	t.Fatalf("failed to find keys mapped to different increment lock stripes")
+	return "", ""
+}
+
+func TestGroupIncrementRejectsNonNumericCachedValue(t *testing.T) {
+	g := NewGroup("test-increment-non-numeric", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return []byte("abc"), nil
+	}))
+	if _, err := g.Get(context.Background(), "counter"); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+
+	_, err := g.Increment(context.Background(), "counter", 1)
+	if !errors.Is(err, ErrNonNumericValue) {
+		t.Fatalf("expected ErrNonNumericValue, got %v", err)
+	}
+}
+
 func TestGroupGetUsesSingleflightForConcurrentRequests(t *testing.T) {
 	var calls int32
 	g := NewGroup("test-singleflight-hot-key", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
@@ -213,7 +408,7 @@ func TestGroupGetBlockedByFilterWhenReady(t *testing.T) {
 		atomic.AddInt32(&calls, 1)
 		return []byte("value"), nil
 	}), filter)
-	g.filterReady.Store(true)
+	g.filter.ready.Store(true)
 
 	_, err := g.Get(context.Background(), "missing-key")
 	if !errors.Is(err, ErrFilterNotFound) {
@@ -232,7 +427,7 @@ func TestWarmupSetsReadyOnSuccess(t *testing.T) {
 
 	g.Warmup([]string{"Tom", "Jack"})
 
-	if !g.filterReady.Load() {
+	if !g.filter.ready.Load() {
 		t.Fatalf("filter should be ready after successful warmup")
 	}
 }
@@ -248,7 +443,7 @@ func TestWarmupKeepsNotReadyOnFailure(t *testing.T) {
 
 	g.Warmup([]string{"Tom", "missing"})
 
-	if g.filterReady.Load() {
+	if g.filter.ready.Load() {
 		t.Fatalf("filter should remain not ready when warmup has failures")
 	}
 }
@@ -350,7 +545,7 @@ func TestFilterRefreshRebuildsFromWarmupKeys(t *testing.T) {
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&calls) >= 2 && g.filterReady.Load() && filter.Contains("Tom") {
+		if atomic.LoadInt32(&calls) >= 2 && g.filter.ready.Load() && filter.Contains("Tom") {
 			return
 		}
 		time.Sleep(time.Millisecond)

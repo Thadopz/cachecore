@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -83,5 +84,37 @@ func TestAPIHandlerReturns404ForErrFilterNotFound(t *testing.T) {
 	}
 	if got := after.APIErrors - before.APIErrors; got != 0 {
 		t.Fatalf("filter not found should not count as api error: got delta %d", got)
+	}
+}
+
+func TestAPIHandlerIncrementReturnsJSONValue(t *testing.T) {
+	var counter int64 = 10
+	g := groupcache.NewGroup("test-api-increment", 1<<20, groupcache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, errors.New("getter should not be called")
+	}), groupcache.WithIncrementer(groupcache.IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		counter += delta
+		return counter, nil
+	})))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/increment?key=counter&delta=5", nil)
+	w := httptest.NewRecorder()
+
+	newAPIHandler(g).ServeHTTP(w, req)
+
+	if got, want := w.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status code: got %d, want %d", got, want)
+	}
+	var payload struct {
+		Key   string `json:"key"`
+		Value int64  `json:"value"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if got, want := payload.Key, "counter"; got != want {
+		t.Fatalf("unexpected key: got %q, want %q", got, want)
+	}
+	if got, want := payload.Value, int64(15); got != want {
+		t.Fatalf("unexpected value: got %d, want %d", got, want)
 	}
 }

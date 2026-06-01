@@ -21,6 +21,7 @@ const (
 	defaultBasePath       = "/_goCache/"
 	defaultReplicas       = 50
 	defaultRPCPath        = "/_goCache/get"
+	defaultIncrementPath  = "/_goCache/increment"
 	defaultInvalidatePath = "/_goCache/invalidate"
 )
 
@@ -110,7 +111,7 @@ func classifyPeerGetError(err error) (code int32, notFound bool) {
 
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	Stats.IncPeerHTTPRequests()
-	if r.URL.Path != defaultRPCPath && r.URL.Path != defaultInvalidatePath {
+	if r.URL.Path != defaultRPCPath && r.URL.Path != defaultInvalidatePath && r.URL.Path != defaultIncrementPath {
 		writeProtoResponse(w, http.StatusBadRequest, "bad request path", nil, false)
 		return
 	}
@@ -142,6 +143,16 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == defaultIncrementPath {
+		next, err := group.incrementLocally(r.Context(), req.GetKey(), req.GetDelta())
+		if err != nil {
+			writeProtoResponse(w, http.StatusInternalServerError, err.Error(), nil, false)
+			return
+		}
+		writeProtoResponse(w, 0, "", []byte(fmt.Sprintf("%d", next)), false)
+		return
+	}
+
 	view, err := group.Get(r.Context(), req.GetKey())
 	if err != nil {
 		code, notFound := classifyPeerGetError(err)
@@ -159,6 +170,10 @@ type httpGetter struct {
 
 func (h *httpGetter) Get(ctx context.Context, in *pb.Request, out *pb.Response) error {
 	return h.doProtoRequest(ctx, "get", in, out)
+}
+
+func (h *httpGetter) Increment(ctx context.Context, in *pb.Request, out *pb.Response) error {
+	return h.doProtoRequest(ctx, "increment", in, out)
 }
 
 func (h *httpGetter) Invalidate(in *pb.Request) error {

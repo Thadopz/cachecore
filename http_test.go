@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -133,6 +134,118 @@ func TestHTTPGetterDoesNotMapFilterNotFoundToErrNotFound(t *testing.T) {
 	}
 	if errors.Is(err, ErrNotFound) {
 		t.Fatalf("filter-not-found response must not map to ErrNotFound: %v", err)
+	}
+}
+
+func TestHTTPPoolServeHTTPIncrementUpdatesLocalCache(t *testing.T) {
+	groupName := "test-http-increment"
+	var counter int64 = 4
+	g := NewGroup(groupName, 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, errors.New("getter should not be called after increment fills cache")
+	}), WithIncrementer(IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		return atomic.AddInt64(&counter, delta), nil
+	})))
+
+	pool := NewHTTPPool("http://self")
+	reqMsg := &pb.Request{Group: groupName, Key: "counter", Delta: 3}
+	body, err := proto.Marshal(reqMsg)
+	if err != nil {
+		t.Fatalf("marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, pool.rpcPath("increment"), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	pool.ServeHTTP(w, req)
+
+	if got, want := w.Code, http.StatusOK; got != want {
+		t.Fatalf("unexpected status code: got %d, want %d", got, want)
+	}
+
+	var resp pb.Response
+	if err := proto.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if got, want := string(resp.GetValue()), "7"; got != want {
+		t.Fatalf("unexpected increment value: got %q, want %q", got, want)
+	}
+
+	view, err := g.Get(context.Background(), "counter")
+	if err != nil {
+		t.Fatalf("get after increment failed: %v", err)
+	}
+	if got, want := view.String(), "7"; got != want {
+		t.Fatalf("unexpected cached value: got %q, want %q", got, want)
+	}
+}
+
+func TestPeerIncrementRoutesToOwner(t *testing.T) {
+	var peerCalls int32
+	peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != defaultBasePath+"increment" {
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
+		}
+		atomic.AddInt32(&peerCalls, 1)
+		var req pb.Request
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := proto.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if got, want := req.GetDelta(), int64(5); got != want {
+			http.Error(w, fmt.Sprintf("unexpected delta: got %d want %d", got, want), http.StatusBadRequest)
+			return
+		}
+		resp := &pb.Response{Value: []byte("12")}
+		data, err := proto.Marshal(resp)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}))
+	defer peerServer.Close()
+
+	selfServer := httptest.NewServer(http.NotFoundHandler())
+	defer selfServer.Close()
+
+	pool := NewHTTPPool(selfServer.URL)
+	pool.Set(selfServer.URL, peerServer.URL)
+
+	var keyForPeer string
+	for i := 0; i < 20000; i++ {
+		k := fmt.Sprintf("peer-increment-%d", i)
+		if pool.peers.Get(k) == peerServer.URL {
+			keyForPeer = k
+			break
+		}
+	}
+	if keyForPeer == "" {
+		t.Fatalf("failed to find key that maps to peer %s", peerServer.URL)
+	}
+
+	g := NewGroup("test-peer-increment", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		return nil, errors.New("local getter should not be called")
+	}), WithIncrementer(IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		return 0, errors.New("local incrementer should not be called")
+	})))
+	g.RegisterPeers(pool)
+
+	next, err := g.Increment(context.Background(), keyForPeer, 5)
+	if err != nil {
+		t.Fatalf("peer increment failed: %v", err)
+	}
+	if got, want := next, int64(12); got != want {
+		t.Fatalf("unexpected peer increment result: got %d, want %d", got, want)
+	}
+	if got := atomic.LoadInt32(&peerCalls); got != 1 {
+		t.Fatalf("peer should be called once: got %d", got)
 	}
 }
 

@@ -65,6 +65,10 @@ type Metrics struct {
 	SwitchSkippedCooldown uint64
 
 	latencySamplingEnabled atomic.Bool
+	latencySampleEvery     uint64
+	apiLatencySamples      uint64
+	groupGetLatencySamples uint64
+	cacheGetLatencySamples uint64
 	apiLatencyWindow       latencyWindow
 	groupGetLatencyWindow  latencyWindow
 	cacheGetLatencyWindow  latencyWindow
@@ -75,6 +79,7 @@ var Stats = newMetrics()
 func newMetrics() *Metrics {
 	m := &Metrics{}
 	m.latencySamplingEnabled.Store(true)
+	atomic.StoreUint64(&m.latencySampleEvery, 1)
 	return m
 }
 
@@ -184,7 +189,7 @@ func (m *Metrics) RecordAPILatency(d time.Duration) {
 	us := uint64(d / time.Microsecond)
 	atomic.AddUint64(&m.APILatencyCount, 1)
 	atomic.AddUint64(&m.APILatencyTotalMicros, us)
-	if m.latencySamplingEnabled.Load() {
+	if m.shouldSampleLatency(&m.apiLatencySamples) {
 		m.apiLatencyWindow.observe(us)
 	}
 }
@@ -200,7 +205,7 @@ func (m *Metrics) RecordGroupGetLatency(d time.Duration) {
 	us := uint64(d / time.Microsecond)
 	atomic.AddUint64(&m.GroupGetLatencyCount, 1)
 	atomic.AddUint64(&m.GroupGetTotalMicros, us)
-	if m.latencySamplingEnabled.Load() {
+	if m.shouldSampleLatency(&m.groupGetLatencySamples) {
 		m.groupGetLatencyWindow.observe(us)
 	}
 }
@@ -220,13 +225,41 @@ func (m *Metrics) RecordCacheGetLatency(d time.Duration) {
 	us := uint64(d / time.Microsecond)
 	atomic.AddUint64(&m.CacheGetLatencyCount, 1)
 	atomic.AddUint64(&m.CacheGetTotalMicros, us)
-	if m.latencySamplingEnabled.Load() {
+	if m.shouldSampleLatency(&m.cacheGetLatencySamples) {
 		m.cacheGetLatencyWindow.observe(us)
 	}
 }
 
 func (m *Metrics) SetLatencySamplingEnabled(enabled bool) {
 	m.latencySamplingEnabled.Store(enabled)
+}
+
+func (m *Metrics) SetLatencySampleRate(rate float64) {
+	if rate <= 0 {
+		m.latencySamplingEnabled.Store(false)
+		return
+	}
+	m.latencySamplingEnabled.Store(true)
+	if rate >= 1 {
+		atomic.StoreUint64(&m.latencySampleEvery, 1)
+		return
+	}
+	every := uint64(1 / rate)
+	if every == 0 {
+		every = 1
+	}
+	atomic.StoreUint64(&m.latencySampleEvery, every)
+}
+
+func (m *Metrics) shouldSampleLatency(counter *uint64) bool {
+	if !m.latencySamplingEnabled.Load() {
+		return false
+	}
+	every := atomic.LoadUint64(&m.latencySampleEvery)
+	if every <= 1 {
+		return true
+	}
+	return atomic.AddUint64(counter, 1)%every == 0
 }
 
 func (m *Metrics) IncPeerLoads() {

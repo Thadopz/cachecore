@@ -7,8 +7,7 @@ import (
 	"goCache/singleflight"
 	"log"
 	"math/rand"
-	"sync"
-	"sync/atomic"
+	"strconv"
 	"time"
 
 	pb "goCache/groupcachepb"
@@ -21,6 +20,11 @@ type Group struct {
 	// getter is called when a key is not found in the cache.
 	// It should return the data corresponding to the key.
 	getter Getter
+
+	// incrementer is called by Increment when a durable backend owns writes.
+	// If nil, Increment uses the active cache as an in-memory counter store.
+	incrementer    Incrementer
+	incrementLocks *stripedLocks
 
 	// router owns active/fallback cache state and mode switching.
 	router *cacheRouter
@@ -37,17 +41,11 @@ type Group struct {
 	// <= 0 keeps the original behavior (wait until completion).
 	singleflightWaitTTL time.Duration
 
-	// filter is used to track which keys are present in the cache,
-	// to avoid unnecessary calls to the getter.
-	// it is optional and can be nil if not needed.
-	filter      Filter
-	filterReady atomic.Bool
+	// filter tracks key membership and owns its warmup/refresh lifecycle.
+	filter *filterGate
 
-	filterMu          sync.RWMutex
-	filterWarmupMu    sync.Mutex
-	filterWarmupKeys  []string
-	filterRefresh     time.Duration
-	filterRefreshStop chan struct{}
+	// filterRefresh is the configured refresh interval used at startup.
+	filterRefresh time.Duration
 
 	// janitor is used to periodically clean up expired items from the cache.
 	// it is optional and can be nil if not needed.
@@ -112,6 +110,94 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 
 func (g *Group) currentCaches() (active Cache, fallback Cache) {
 	return g.router.currentCaches()
+}
+
+func (g *Group) Increment(ctx context.Context, key string, delta int64) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if key == "" {
+		return 0, fmt.Errorf("key is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if g.peers != nil {
+		if peer, ok := g.peers.PickPeer(key); ok {
+			incrementer, ok := peer.(PeerIncrementer)
+			if !ok {
+				return 0, ErrIncrementUnsupported
+			}
+			return g.incrementFromPeer(ctx, incrementer, key, delta)
+		}
+	}
+	return g.incrementLocally(ctx, key, delta)
+}
+
+func (g *Group) incrementFromPeer(ctx context.Context, peer PeerIncrementer, key string, delta int64) (int64, error) {
+	request := &pb.Request{
+		Group: g.name,
+		Key:   key,
+		Delta: delta,
+	}
+	response := &pb.Response{}
+	if err := peer.Increment(ctx, request, response); err != nil {
+		return 0, err
+	}
+	return parseNumericValue(response.Value)
+}
+
+func (g *Group) incrementLocally(ctx context.Context, key string, delta int64) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if key == "" {
+		return 0, fmt.Errorf("key is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	active, fallback := g.currentCaches()
+	if active == nil {
+		return 0, ErrIncrementUnsupported
+	}
+
+	if g.incrementer == nil {
+		next, err := active.increment(key, delta, g.nextTTL(), g.stampActiveValue)
+		if err != nil {
+			return 0, err
+		}
+		if fallback != nil {
+			fallback.remove(key)
+		}
+		g.filter.add(key)
+		return next, nil
+	}
+
+	unlock := g.incrementLocks.lock(key)
+	defer unlock()
+
+	active, fallback = g.currentCaches()
+	if active == nil {
+		return 0, ErrIncrementUnsupported
+	}
+	next, err := g.incrementer.Increment(ctx, key, delta)
+	if err != nil {
+		return 0, err
+	}
+	value := g.stampActiveValue([]byte(strconv.FormatInt(next, 10)))
+	ttl := g.nextTTL()
+	if ttl > 0 {
+		active.addWithTTL(key, value, ttl)
+	} else {
+		active.add(key, value)
+	}
+	if fallback != nil {
+		fallback.remove(key)
+	}
+	g.filter.add(key)
+	return next, nil
 }
 
 // if mainCache doesn't have the key, it should return an error, so that the getter can fallback to getFromPeer
@@ -219,9 +305,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 			active.add(key, value)
 		}
 	}
-	if g.filter != nil {
-		g.filter.Add(key)
-	}
+	g.filter.add(key)
 	return value, nil
 }
 
@@ -254,19 +338,12 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	} else {
 		active.add(key, value)
 	}
-	if g.filter != nil {
-		g.filter.Add(key)
-	}
+	g.filter.add(key)
 	return value, nil
 }
 
 func (g *Group) filterRejects(key string) bool {
-	if g.filter == nil {
-		return false
-	}
-	g.filterMu.RLock()
-	defer g.filterMu.RUnlock()
-	return g.filterReady.Load() && !g.filter.Contains(key)
+	return g.filter.rejects(key)
 }
 
 func (g *Group) nextTTL() time.Duration {
@@ -292,9 +369,7 @@ func (g *Group) getLocallyOnlyForWarmUp(ctx context.Context, key string) (ByteVi
 		return ByteView{}, err
 	}
 	value := ByteView{b: cloneBytes(bytes)}
-	if g.filter != nil {
-		g.filter.Add(key)
-	}
+	g.filter.add(key)
 	return value, nil
 }
 
@@ -310,19 +385,13 @@ func (g *Group) Warmup(keys []string) {
 		g.Log("No filter set, skipping warmup")
 		return
 	}
-	keys = cloneStrings(keys)
-	mark := true
-	for _, key := range keys {
-		if _, err := g.getLocallyOnlyForWarmUp(context.Background(), key); err != nil {
-			mark = false
+	if g.filter.warmup(keys, func(ctx context.Context, key string) error {
+		_, err := g.getLocallyOnlyForWarmUp(ctx, key)
+		if err != nil {
 			g.Log("Failed to warmup key %s: %v", key, err)
 		}
-	}
-	if mark {
-		g.filterWarmupMu.Lock()
-		g.filterWarmupKeys = keys
-		g.filterWarmupMu.Unlock()
-		g.filterReady.Store(true)
+		return err
+	}) {
 		g.Log("Warmup completed successfully")
 	}
 }

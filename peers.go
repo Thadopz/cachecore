@@ -13,6 +13,10 @@ type PeerGetter interface {
 	Get(ctx context.Context, in *pb.Request, out *pb.Response) error
 }
 
+type PeerIncrementer interface {
+	Increment(ctx context.Context, in *pb.Request, out *pb.Response) error
+}
+
 type PeerInvalidator interface {
 	Invalidate(in *pb.Request) error
 }
