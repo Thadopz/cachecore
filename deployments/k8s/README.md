@@ -1,50 +1,51 @@
-# goCache on Kubernetes
+# cachecore on Kubernetes
 
-这个目录提供 goCache 项目的最小可运行 K8s 部署。
+This directory contains a minimal Kubernetes deployment for the cachecore demo
+server.
 
-## 架构
+## Architecture
 
-- `go-cache`：StatefulSet，3 副本，每个 Pod 同时提供
-  - Peer 端口 `8001`（groupcache 节点互联）
-  - API 端口 `9999`（`/api` 和 `/debug/stats`）
-- `redis`：单副本 Deployment，用作 getter 的后端缓存源
-- `gocache`：Headless Service（给 StatefulSet 稳定 DNS）
-- `gocache-api`：ClusterIP Service（对内统一访问 API）
+- `go-cache`: a 3-replica StatefulSet. Each pod exposes:
+  - peer port `8001` for cache node traffic
+  - API port `9999` for `/api` and `/debug/stats`
+- `redis`: a single-replica Deployment used as the demo backend.
+- `gocache`: a headless Service for stable StatefulSet DNS.
+- `gocache-api`: a ClusterIP Service for API access inside the cluster.
 
-## 1. 快速上手（kind）
+## Quick Start with kind
 
-1. 创建集群：
+Create the cluster:
 
 ```powershell
 kind create cluster --name gocache
 ```
 
-2. 在仓库根目录构建镜像：
+Build the image from the repository root:
 
 ```powershell
 docker build -t gocache:local .
 ```
 
-3. 将镜像加载到 kind：
+Load the image into kind:
 
 ```powershell
 kind load docker-image gocache:local --name gocache
 ```
 
-4. 部署：
+Deploy:
 
 ```powershell
-kubectl apply -k ./k8s
+kubectl apply -k ./deployments/k8s
 ```
 
-5. 查看状态：
+Check status:
 
 ```powershell
 kubectl -n gocache get pods -w
 kubectl -n gocache get svc
 ```
 
-6. 本地访问 API：
+Forward the API locally:
 
 ```powershell
 kubectl -n gocache port-forward svc/gocache-api 9999:9999
@@ -52,22 +53,23 @@ curl "http://127.0.0.1:9999/api?key=Tom"
 curl "http://127.0.0.1:9999/debug/stats"
 ```
 
-## 2. 通用集群部署（非 kind）
+## Remote Clusters
 
-如果你是远端集群（AKS/EKS/GKE/自建），请先把镜像推送到可访问仓库，然后把 `cache-statefulset.yaml` 里的镜像改成你的地址，例如：
+For AKS, EKS, GKE, or self-hosted clusters, push the image to a registry first,
+then update `cache-statefulset.yaml`:
 
 ```yaml
-image: registry.example.com/team/gocache:v1
+image: registry.example.com/team/cachecore:v1
 imagePullPolicy: IfNotPresent
 ```
 
-然后执行：
+Apply the manifests:
 
 ```powershell
-kubectl apply -k ./k8s
+kubectl apply -k ./deployments/k8s
 ```
 
-## 3. 常用排查
+## Troubleshooting
 
 ```powershell
 kubectl -n gocache logs statefulset/go-cache -c server --tail=200
@@ -75,15 +77,14 @@ kubectl -n gocache describe pod go-cache-0
 kubectl -n gocache get endpoints gocache
 ```
 
-如果 Pod 频繁重启，优先检查：
+If pods restart frequently, check:
 
-- 镜像是否可拉取
-- `redis` 是否就绪
-- `-self-addr` 和 `-peers` 是否和 StatefulSet 副本数一致
+- whether the image can be pulled
+- whether `redis` is ready
+- whether `-self-addr` and `-peers` match the StatefulSet replica count
 
-## 4. 扩缩容说明
+## Scaling
 
-当前清单把 `-peers` 写成 3 个固定 Pod DNS，因此更适合固定 3 副本场景。若要动态扩缩容，建议后续改造为：
-
-- 从 Endpoints 自动发现 peer
-- 或在启动脚本中根据 DNS 结果生成 `-peers`
+The current manifests hard-code `-peers` for three pod DNS names, so they are
+best suited to a fixed 3-replica deployment. For dynamic scaling, add endpoint
+discovery or generate `-peers` from DNS during startup.
