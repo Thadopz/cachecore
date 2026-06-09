@@ -1,4 +1,4 @@
-module goCache
+module github.com/Thadopz/cachecore
 
 go 1.25.3
 

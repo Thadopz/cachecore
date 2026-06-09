@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package groupCachepb; 
-option go_package = "goCache/groupcachepb";
+option go_package = "github.com/Thadopz/cachecore/internal/groupcachepb";
 
 message Request {
   string group = 1;

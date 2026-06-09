@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	. "goCache/lru"
+	. "github.com/Thadopz/cachecore/internal/lru"
 )
 
 type String string

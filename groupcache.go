@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"goCache/singleflight"
+	"github.com/Thadopz/cachecore/internal/singleflight"
 	"log"
 	"math/rand"
 	"strconv"
 	"time"
 
-	pb "goCache/groupcachepb"
+	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
 )
 
 type Group struct {
@@ -31,7 +31,7 @@ type Group struct {
 
 	// peers is used to pick a peer to get the value for a key.
 	// It is set by RegisterPeers and should not be nil after that.
-	peers PeerPicker
+	peers *HTTPPool
 
 	// loader is used to ensure that each key is only fetched once
 	// even if there are concurrent requests for the same key.
@@ -114,18 +114,14 @@ func (g *Group) Increment(ctx context.Context, key string, delta int64) (int64, 
 		return 0, err
 	}
 	if g.peers != nil {
-		if peer, ok := g.peers.PickPeer(key); ok {
-			incrementer, ok := peer.(PeerIncrementer)
-			if !ok {
-				return 0, ErrIncrementUnsupported
-			}
-			return g.incrementFromPeer(ctx, incrementer, key, delta)
+		if peer, ok := g.peers.pickPeer(key); ok {
+			return g.incrementFromPeer(ctx, peer, key, delta)
 		}
 	}
 	return g.incrementLocally(ctx, key, delta)
 }
 
-func (g *Group) incrementFromPeer(ctx context.Context, peer PeerIncrementer, key string, delta int64) (int64, error) {
+func (g *Group) incrementFromPeer(ctx context.Context, peer *httpGetter, key string, delta int64) (int64, error) {
 	request := &pb.Request{
 		Group: g.name,
 		Key:   key,
@@ -199,7 +195,7 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	loadCtx := context.WithoutCancel(ctx)
 	loadFn := func() (interface{}, error) {
 		if g.peers != nil {
-			if peer, ok := g.peers.PickPeer(key); ok {
+			if peer, ok := g.peers.pickPeer(key); ok {
 				if value, err := g.getFromPeer(loadCtx, peer, key); err == nil {
 					return value, nil
 				} else if errors.Is(err, ErrNotFound) {
@@ -270,7 +266,7 @@ func (g *Group) degradeFromCaches(key string) (ByteView, bool, bool) {
 	return ByteView{}, false, false
 }
 
-func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (ByteView, error) {
+func (g *Group) getFromPeer(ctx context.Context, peer *httpGetter, key string) (ByteView, error) {
 	Stats.IncPeerLoads()
 	request := &pb.Request{
 		Group: g.name,
@@ -383,9 +379,9 @@ func (g *Group) stampActiveValue(b []byte) ByteView {
 	return ByteView{b: b}
 }
 
-func (g *Group) RegisterPeers(peers PeerPicker) {
+func (g *Group) RegisterPeers(peers *HTTPPool) {
 	if g.peers != nil {
-		panic("RegisterPeerPicker called more than once")
+		panic("RegisterPeers called more than once")
 	}
 	g.peers = peers
 }
@@ -411,11 +407,7 @@ func (g *Group) Invalidate(key string) {
 	if g.peers == nil {
 		return
 	}
-	broadcaster, ok := g.peers.(PeerInvalidationBroadcaster)
-	if !ok {
-		return
-	}
-	if err := broadcaster.BroadcastInvalidate(&pb.Request{Group: g.name, Key: key}); err != nil {
+	if err := g.peers.broadcastInvalidate(&pb.Request{Group: g.name, Key: key}); err != nil {
 		g.Log("broadcast invalidate key=%s failed: %v", key, err)
 	}
 }

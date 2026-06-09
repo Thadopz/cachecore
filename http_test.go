@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	pb "goCache/groupcachepb"
-	"goCache/singleflight"
+	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
+	"github.com/Thadopz/cachecore/internal/singleflight"
 
 	"google.golang.org/protobuf/proto"
 )

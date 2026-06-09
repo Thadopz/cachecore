@@ -327,8 +327,10 @@ func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
 		t.Fatalf("expected ErrSingleflightWaitTimeout, got value=%q err=%v", v.String(), err)
 	}
 
+	firstReturned := false
 	select {
 	case err := <-firstDone:
+		firstReturned = true
 		if !errors.Is(err, ErrSingleflightWaitTimeout) {
 			t.Fatalf("first load should also timeout under strict waitTTL policy: %v", err)
 		}
@@ -336,9 +338,11 @@ func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
 		// still running means the second request really exited before first load finished.
 	}
 
-	err = <-firstDone
-	if !errors.Is(err, ErrSingleflightWaitTimeout) {
-		t.Fatalf("first load should timeout: %v", err)
+	if !firstReturned {
+		err = <-firstDone
+		if !errors.Is(err, ErrSingleflightWaitTimeout) {
+			t.Fatalf("first load should timeout: %v", err)
+		}
 	}
 
 	time.Sleep(90 * time.Millisecond)

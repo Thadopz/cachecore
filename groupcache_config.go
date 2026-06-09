@@ -3,7 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
-	"goCache/singleflight"
+	"github.com/Thadopz/cachecore/internal/singleflight"
 	"sync"
 	"time"
 )

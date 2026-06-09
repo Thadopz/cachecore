@@ -7,7 +7,7 @@ mkdir -p .gocache-linux .gotmp-linux test-logs/decomp-wsl
 
 GOCACHE=/mnt/e/goCache/.gocache-linux \
 GOTMPDIR=/mnt/e/goCache/.gotmp-linux \
-go build -o test-logs/decomp-wsl/decomp-server-linux ./main
+go build -o test-logs/decomp-wsl/decomp-server-linux ./cmd/cache-server
 
 pkill -f decomp-server-linux 2>/dev/null || true
 

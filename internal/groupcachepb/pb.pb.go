@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v5.29.3
-// source: pb.proto
+// source: internal/groupcachepb/pb.proto
 
 package groupcachepb
 
@@ -32,7 +32,7 @@ type Request struct {
 
 func (x *Request) Reset() {
 	*x = Request{}
-	mi := &file_pb_proto_msgTypes[0]
+	mi := &file_internal_groupcachepb_pb_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -44,7 +44,7 @@ func (x *Request) String() string {
 func (*Request) ProtoMessage() {}
 
 func (x *Request) ProtoReflect() protoreflect.Message {
-	mi := &file_pb_proto_msgTypes[0]
+	mi := &file_internal_groupcachepb_pb_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -57,7 +57,7 @@ func (x *Request) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Request.ProtoReflect.Descriptor instead.
 func (*Request) Descriptor() ([]byte, []int) {
-	return file_pb_proto_rawDescGZIP(), []int{0}
+	return file_internal_groupcachepb_pb_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *Request) GetGroup() string {
@@ -93,7 +93,7 @@ type Response struct {
 
 func (x *Response) Reset() {
 	*x = Response{}
-	mi := &file_pb_proto_msgTypes[1]
+	mi := &file_internal_groupcachepb_pb_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -105,7 +105,7 @@ func (x *Response) String() string {
 func (*Response) ProtoMessage() {}
 
 func (x *Response) ProtoReflect() protoreflect.Message {
-	mi := &file_pb_proto_msgTypes[1]
+	mi := &file_internal_groupcachepb_pb_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -118,7 +118,7 @@ func (x *Response) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Response.ProtoReflect.Descriptor instead.
 func (*Response) Descriptor() ([]byte, []int) {
-	return file_pb_proto_rawDescGZIP(), []int{1}
+	return file_internal_groupcachepb_pb_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *Response) GetValue() []byte {
@@ -149,11 +149,11 @@ func (x *Response) GetNotFound() bool {
 	return false
 }
 
-var File_pb_proto protoreflect.FileDescriptor
+var File_internal_groupcachepb_pb_proto protoreflect.FileDescriptor
 
-const file_pb_proto_rawDesc = "" +
+const file_internal_groupcachepb_pb_proto_rawDesc = "" +
 	"\n" +
-	"\bpb.proto\x12\fgroupCachepb\"G\n" +
+	"\x1einternal/groupcachepb/pb.proto\x12\fgroupCachepb\"G\n" +
 	"\aRequest\x12\x14\n" +
 	"\x05group\x18\x01 \x01(\tR\x05group\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
@@ -165,26 +165,26 @@ const file_pb_proto_rawDesc = "" +
 	"\bnotFound\x18\x04 \x01(\bR\bnotFound2B\n" +
 	"\n" +
 	"GroupCache\x124\n" +
-	"\x03Get\x12\x15.groupCachepb.Request\x1a\x16.groupCachepb.ResponseB\x16Z\x14goCache/groupcachepbb\x06proto3"
+	"\x03Get\x12\x15.groupCachepb.Request\x1a\x16.groupCachepb.ResponseB4Z2github.com/Thadopz/cachecore/internal/groupcachepbb\x06proto3"
 
 var (
-	file_pb_proto_rawDescOnce sync.Once
-	file_pb_proto_rawDescData []byte
+	file_internal_groupcachepb_pb_proto_rawDescOnce sync.Once
+	file_internal_groupcachepb_pb_proto_rawDescData []byte
 )
 
-func file_pb_proto_rawDescGZIP() []byte {
-	file_pb_proto_rawDescOnce.Do(func() {
-		file_pb_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_pb_proto_rawDesc), len(file_pb_proto_rawDesc)))
+func file_internal_groupcachepb_pb_proto_rawDescGZIP() []byte {
+	file_internal_groupcachepb_pb_proto_rawDescOnce.Do(func() {
+		file_internal_groupcachepb_pb_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_groupcachepb_pb_proto_rawDesc), len(file_internal_groupcachepb_pb_proto_rawDesc)))
 	})
-	return file_pb_proto_rawDescData
+	return file_internal_groupcachepb_pb_proto_rawDescData
 }
 
-var file_pb_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_pb_proto_goTypes = []any{
+var file_internal_groupcachepb_pb_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_internal_groupcachepb_pb_proto_goTypes = []any{
 	(*Request)(nil),  // 0: groupCachepb.Request
 	(*Response)(nil), // 1: groupCachepb.Response
 }
-var file_pb_proto_depIdxs = []int32{
+var file_internal_groupcachepb_pb_proto_depIdxs = []int32{
 	0, // 0: groupCachepb.GroupCache.Get:input_type -> groupCachepb.Request
 	1, // 1: groupCachepb.GroupCache.Get:output_type -> groupCachepb.Response
 	1, // [1:2] is the sub-list for method output_type
@@ -194,26 +194,26 @@ var file_pb_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_pb_proto_init() }
-func file_pb_proto_init() {
-	if File_pb_proto != nil {
+func init() { file_internal_groupcachepb_pb_proto_init() }
+func file_internal_groupcachepb_pb_proto_init() {
+	if File_internal_groupcachepb_pb_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pb_proto_rawDesc), len(file_pb_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_groupcachepb_pb_proto_rawDesc), len(file_internal_groupcachepb_pb_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_pb_proto_goTypes,
-		DependencyIndexes: file_pb_proto_depIdxs,
-		MessageInfos:      file_pb_proto_msgTypes,
+		GoTypes:           file_internal_groupcachepb_pb_proto_goTypes,
+		DependencyIndexes: file_internal_groupcachepb_pb_proto_depIdxs,
+		MessageInfos:      file_internal_groupcachepb_pb_proto_msgTypes,
 	}.Build()
-	File_pb_proto = out.File
-	file_pb_proto_goTypes = nil
-	file_pb_proto_depIdxs = nil
+	File_internal_groupcachepb_pb_proto = out.File
+	file_internal_groupcachepb_pb_proto_goTypes = nil
+	file_internal_groupcachepb_pb_proto_depIdxs = nil
 }

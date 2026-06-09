@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"goCache/consistenthash"
-	pb "goCache/groupcachepb"
+	"github.com/Thadopz/cachecore/internal/consistenthash"
+	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
 	"io"
 	"log"
 	"net"
@@ -75,7 +75,7 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
-func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
+func (p *HTTPPool) pickPeer(key string) (*httpGetter, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.peers == nil {
@@ -245,7 +245,7 @@ func (h *httpGetter) doProtoRequest(ctx context.Context, action string, in *pb.R
 	return nil
 }
 
-func (p *HTTPPool) BroadcastInvalidate(in *pb.Request) error {
+func (p *HTTPPool) broadcastInvalidate(in *pb.Request) error {
 	p.mu.RLock()
 	peers := make([]*httpGetter, 0, len(p.httpGetters))
 	for peer, getter := range p.httpGetters {

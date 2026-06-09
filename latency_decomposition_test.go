@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	pb "goCache/groupcachepb"
+	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
 
 	"google.golang.org/protobuf/proto"
 )

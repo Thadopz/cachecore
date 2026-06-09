@@ -60,8 +60,8 @@ go test ./... -run '^$' -bench . -benchmem
 
 ```powershell
 go test . -run '^$' -bench BenchmarkGroup -benchmem
-go test ./lru -run '^$' -bench . -benchmem
-go test ./singleflight -run '^$' -bench . -benchmem
+go test ./internal/lru -run '^$' -bench . -benchmem
+go test ./internal/singleflight -run '^$' -bench . -benchmem
 go test ./bloomfilter -run '^$' -bench . -benchmem
 ```
 
@@ -80,7 +80,7 @@ go tool pprof -http=:0 .\\server.exe test-logs\\pprof\\cpu-*.pb.gz
 go tool pprof -top .\\server.exe test-logs\\pprof\\heap-*.pb.gz
 ```
 
-说明：`main/main.go` 已导入 `net/http/pprof`，因此 API 服务会暴露 `/debug/pprof/*`。
+说明：`cmd/cache-server/main.go` 已导入 `net/http/pprof`，因此 API 服务会暴露 `/debug/pprof/*`。
 
 ## 4) Static Strategy Notes
 

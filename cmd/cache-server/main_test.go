@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	groupcache "goCache"
+	groupcache "github.com/Thadopz/cachecore"
 )
 
 func TestAPIHandlerReturns404ForErrNotFound(t *testing.T) {

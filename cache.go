@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"goCache/lru"
+	"github.com/Thadopz/cachecore/internal/lru"
 )
 
 type Cache interface {

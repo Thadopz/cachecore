@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	groupcache "goCache"
+	groupcache "github.com/Thadopz/cachecore"
 )
 
 func disableLatencySamplingForMainBench(b *testing.B) {

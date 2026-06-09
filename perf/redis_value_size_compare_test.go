@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	groupcache "goCache"
+	groupcache "github.com/Thadopz/cachecore"
 
 	"github.com/redis/go-redis/v9"
 )
