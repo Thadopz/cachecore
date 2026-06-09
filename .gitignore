@@ -1,12 +1,36 @@
 # IDE / local workspace
-.vscode/*.json
+.vscode/
+*.code-workspace
+.github/
+
+# Local context / scratch files
 summary.md
+query
+$block
+$mutex
+
+# Temporary documents
+*.docx
+~$*.docx
+
+# Local environment config
+.env
+.env.*
+*.local.json
+*.local.yaml
+*.local.yml
+config.local.*
 
 # Build outputs
 *.exe
 .gocache/
-$block
-$mutex
+.gocache-linux/
+.gotmp-linux/
+tmp-render/
+
+# Generated profiles
+profile*.pb.gz
+profile*.svg
 
 # Generated test and benchmark artifacts
 test-logs/
@@ -25,6 +49,3 @@ perf/dynamic-window*.log
 !perf/*.js
 !perf/*.md
 !perf/*_test.go
-
-# Repo config
-.github

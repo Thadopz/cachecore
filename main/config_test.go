@@ -3,8 +3,6 @@ package main
 import (
 	"reflect"
 	"testing"
-
-	groupcache "goCache"
 )
 
 func TestSplitCSV(t *testing.T) {
@@ -40,32 +38,5 @@ func TestDefaultWarmupKeys(t *testing.T) {
 	}
 	if got[len(got)-1] != "key100" {
 		t.Fatalf("defaultWarmupKeys should include seeded numeric keys, got last=%q", got[len(got)-1])
-	}
-}
-
-func TestNewWindowMissRateSampler(t *testing.T) {
-	snapshots := []groupcache.MetricsSnapshot{
-		{GroupGets: 100, CacheMisses: 40},
-		{GroupGets: 120, CacheMisses: 50},
-		{GroupGets: 120, CacheMisses: 50},
-		{GroupGets: 150, CacheMisses: 65},
-	}
-	var i int
-	sampler := newWindowMissRateSampler(func() groupcache.MetricsSnapshot {
-		s := snapshots[i]
-		if i < len(snapshots)-1 {
-			i++
-		}
-		return s
-	})
-
-	if got, want := sampler(), 0.5; got != want {
-		t.Fatalf("first window miss rate = %v, want %v", got, want)
-	}
-	if got, want := sampler(), -1.0; got != want {
-		t.Fatalf("empty window should be skipped with sentinel value: got %v, want %v", got, want)
-	}
-	if got, want := sampler(), 0.5; got != want {
-		t.Fatalf("second non-empty window miss rate = %v, want %v", got, want)
 	}
 }

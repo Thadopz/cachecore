@@ -9,6 +9,7 @@ import (
 	pb "goCache/groupcachepb"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -25,7 +26,27 @@ const (
 	defaultInvalidatePath = "/_goCache/invalidate"
 )
 
-var defaultInvalidateTimeout = 2 * time.Second
+var (
+	defaultInvalidateTimeout = 2 * time.Second
+	peerHTTPClient           = newPeerHTTPClient()
+)
+
+func newPeerHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   2 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.MaxIdleConns = 4096
+	transport.MaxIdleConnsPerHost = 1024
+	transport.MaxConnsPerHost = 0
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.TLSHandshakeTimeout = 2 * time.Second
+	transport.ExpectContinueTimeout = time.Second
+	transport.DisableCompression = true
+	transport.ForceAttemptHTTP2 = false
+	return &http.Client{Transport: transport}
+}
 
 type HTTPPool struct {
 	self        string
@@ -198,7 +219,7 @@ func (h *httpGetter) doProtoRequest(ctx context.Context, action string, in *pb.R
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := peerHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to perform request: %v", err)
 	}

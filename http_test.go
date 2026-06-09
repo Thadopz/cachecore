@@ -305,7 +305,7 @@ func TestPeerPathEndToEndNotFoundNoLocalFallback(t *testing.T) {
 	}
 }
 
-func TestPeerPathCachesPeerValueWithEpoch(t *testing.T) {
+func TestPeerPathCachesPeerValue(t *testing.T) {
 	var peerCalls int32
 	peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != defaultBasePath+"get" {
@@ -344,7 +344,7 @@ func TestPeerPathCachesPeerValueWithEpoch(t *testing.T) {
 	}
 
 	var localCalls int32
-	g := NewGroup("test-peer-cache-epoch", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+	g := NewGroup("test-peer-cache-value", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		atomic.AddInt32(&localCalls, 1)
 		return []byte("local-value"), nil
 	}))
@@ -373,16 +373,13 @@ func TestPeerPathCachesPeerValueWithEpoch(t *testing.T) {
 		t.Fatalf("local getter should not be called on peer hit: got %d", got)
 	}
 
-	active, _ := g.currentCaches()
+	active := g.mainCache
 	cached, ok := active.get(keyForPeer)
 	if !ok {
-		t.Fatalf("expected peer value to be cached in active cache")
+		t.Fatalf("expected peer value to be cached")
 	}
 	if got, want := cached.String(), "peer-value"; got != want {
 		t.Fatalf("unexpected cached value: got %q, want %q", got, want)
-	}
-	if cached.epoch == 0 {
-		t.Fatalf("cached peer value should carry active epoch")
 	}
 }
 
@@ -447,10 +444,10 @@ func TestInvalidateBroadcastRemovesPeerEntry(t *testing.T) {
 	localPool.Set("http://self", remoteServer.URL)
 
 	localGroup := &Group{
-		name:   groupName,
-		router: newCacheRouter(&cache{cacheBytes: 1 << 20}, CacheModeUnsharded, 90*time.Second, 30*time.Second, 1<<20, nil, 256, AutoSwitchPolicy{}),
-		peers:  localPool,
-		loader: &singleflight.Group{},
+		name:      groupName,
+		mainCache: &cache{cacheBytes: 1 << 20},
+		peers:     localPool,
+		loader:    &singleflight.Group{},
 	}
 
 	localGroup.Invalidate("Tom")

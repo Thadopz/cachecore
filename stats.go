@@ -33,9 +33,6 @@ type MetricsSnapshot struct {
 	LocalLoads            uint64
 	PeerHTTPRequests      uint64
 	FilterMisses          uint64
-	SwitchToSharded       uint64
-	SwitchToUnsharded     uint64
-	SwitchSkippedCooldown uint64
 }
 
 type Metrics struct {
@@ -60,9 +57,6 @@ type Metrics struct {
 	LocalLoads            uint64
 	PeerHTTPRequests      uint64
 	FilterMisses          uint64
-	SwitchToSharded       uint64
-	SwitchToUnsharded     uint64
-	SwitchSkippedCooldown uint64
 
 	latencySamplingEnabled atomic.Bool
 	latencySampleEvery     uint64
@@ -168,9 +162,6 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		PeerLoads:             atomic.LoadUint64(&m.PeerLoads),
 		LocalLoads:            atomic.LoadUint64(&m.LocalLoads),
 		PeerHTTPRequests:      atomic.LoadUint64(&m.PeerHTTPRequests),
-		SwitchToSharded:       atomic.LoadUint64(&m.SwitchToSharded),
-		SwitchToUnsharded:     atomic.LoadUint64(&m.SwitchToUnsharded),
-		SwitchSkippedCooldown: atomic.LoadUint64(&m.SwitchSkippedCooldown),
 	}
 }
 
@@ -278,18 +269,6 @@ func (m *Metrics) IncFilterMisses() {
 	atomic.AddUint64(&m.FilterMisses, 1)
 }
 
-func (m *Metrics) IncSwitchToSharded() {
-	atomic.AddUint64(&m.SwitchToSharded, 1)
-}
-
-func (m *Metrics) IncSwitchToUnsharded() {
-	atomic.AddUint64(&m.SwitchToUnsharded, 1)
-}
-
-func (m *Metrics) IncSwitchSkippedCooldown() {
-	atomic.AddUint64(&m.SwitchSkippedCooldown, 1)
-}
-
 func (m *Metrics) StartLogger(interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Second * 5
@@ -341,7 +320,7 @@ func (m *Metrics) StartLogger(interval time.Duration) {
 			cacheAvgMs = float64(current.CacheGetTotalMicros) / float64(current.CacheGetLatencyCount) / 1000.0
 		}
 
-		log.Printf("stats interval=%s api_qps=%.2f peer_qps=%.2f lat_ms(api_avg=%.3f api_p95=%.3f api_p99=%.3f group_avg=%.3f group_p95=%.3f group_p99=%.3f cache_avg=%.3f cache_p95=%.3f cache_p99=%.3f) totals(api=%d api_err=%d gets=%d hits=%d misses=%d peer_load=%d local_load=%d peer_http=%d switch_sharded=%d switch_unsharded=%d switch_cooldown_skip=%d hit_rate=%.2f%%)",
+		log.Printf("stats interval=%s api_qps=%.2f peer_qps=%.2f lat_ms(api_avg=%.3f api_p95=%.3f api_p99=%.3f group_avg=%.3f group_p95=%.3f group_p99=%.3f cache_avg=%.3f cache_p95=%.3f cache_p99=%.3f) totals(api=%d api_err=%d gets=%d hits=%d misses=%d peer_load=%d local_load=%d peer_http=%d hit_rate=%.2f%%)",
 			interval,
 			apiQPS,
 			peerQPS,
@@ -362,9 +341,6 @@ func (m *Metrics) StartLogger(interval time.Duration) {
 			current.PeerLoads,
 			current.LocalLoads,
 			current.PeerHTTPRequests,
-			current.SwitchToSharded,
-			current.SwitchToUnsharded,
-			current.SwitchSkippedCooldown,
 			hitRate,
 		)
 

@@ -2,7 +2,6 @@ package cache
 
 type ByteView struct {
 	b        []byte
-	epoch    uint64
 	notFound bool
 }
 
@@ -16,11 +15,6 @@ func (v ByteView) String() string {
 
 func (v ByteView) ByteSlice() []byte {
 	return cloneBytes(v.b)
-}
-
-func (v ByteView) withEpoch(epoch uint64) ByteView {
-	v.epoch = epoch
-	return v
 }
 
 func (v ByteView) withNotFound() ByteView {

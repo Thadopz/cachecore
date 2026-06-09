@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func disableLatencySamplingForBench(b *testing.B) {
@@ -96,40 +95,20 @@ func BenchmarkGroupGetParallelColdKey(b *testing.B) {
 func BenchmarkGroupGetStrategyComparisonParallel(b *testing.B) {
 	disableLatencySamplingForBench(b)
 	cases := []struct {
-		name    string
-		new     func() *Group
-		dynamic bool
+		name string
+		new  func() *Group
 	}{
-		{
-			name: "dynamic-auto-switch",
-			new: func() *Group {
-				return newBenchGroupWithOptions(
-					WithSwitchCooldown(0),
-					WithFallbackTTL(2*time.Second),
-					WithAutoSwitchByMissRate(AutoSwitchPolicy{
-						Enable:          true,
-						MissRateHigh:    0.6,
-						MissRateLow:     0.2,
-						HighConsecutive: 2,
-						LowConsecutive:  2,
-					}),
-				)
-			},
-			dynamic: true,
-		},
 		{
 			name: "static-sharded",
 			new: func() *Group {
 				return newBenchGroupWithOptions(WithShardedCache(256))
 			},
-			dynamic: false,
 		},
 		{
 			name: "static-unsharded",
 			new: func() *Group {
 				return newBenchGroupWithOptions()
 			},
-			dynamic: false,
 		},
 	}
 
@@ -158,14 +137,6 @@ func BenchmarkGroupGetStrategyComparisonParallel(b *testing.B) {
 						b.Fatalf("get failed: %v", err)
 					}
 
-					if tc.dynamic && n%512 == 0 {
-						phase := (n / 512) % 8
-						if phase < 4 {
-							_ = g.EvaluateAutoSwitchOnce(0.8)
-						} else {
-							_ = g.EvaluateAutoSwitchOnce(0.1)
-						}
-					}
 				}
 			})
 		})

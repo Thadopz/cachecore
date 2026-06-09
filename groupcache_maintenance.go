@@ -13,14 +13,14 @@ func (j *Janitor) Run(g *Group) {
 	for {
 		select {
 		case <-ticker.C:
-			active, fallback := g.currentCaches()
+			active := g.mainCache
 			if active != nil {
 				active.clearupExpired()
 			}
-			if fallback != nil {
-				fallback.clearupExpired()
+			stale := g.staleCache
+			if stale != nil {
+				stale.clearupExpired()
 			}
-			g.CleanupFallback()
 		case <-j.stop:
 			return
 		}

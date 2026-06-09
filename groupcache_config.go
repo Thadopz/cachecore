@@ -46,33 +46,11 @@ type ResettableFilter interface {
 
 type Option func(*Options)
 
-type CacheMode int
-
-const (
-	CacheModeUnsharded CacheMode = iota
-	CacheModeSharded
-)
-
-type AutoSwitchPolicy struct {
-	Enable bool
-
-	// MissRateHigh triggers switch to sharded mode after HighConsecutive windows.
-	MissRateHigh float64
-
-	// MissRateLow triggers switch to unsharded mode after LowConsecutive windows.
-	MissRateLow float64
-
-	// HighConsecutive / LowConsecutive define required consecutive intervals.
-	HighConsecutive int
-	LowConsecutive  int
-}
-
 var (
 	ErrFilterNotFound          = errors.New("key not found in filter")
 	ErrNotFound                = errors.New("key not found")
 	ErrNonNumericValue         = errors.New("cache value is not numeric")
 	ErrIncrementUnsupported    = errors.New("peer does not support increment")
-	ErrSwitchCooldown          = errors.New("cache mode switch is in cooldown")
 	ErrSingleflightWaitTimeout = errors.New("singleflight wait timeout")
 	mu                         sync.RWMutex
 	groups                     = make(map[string]*Group)
@@ -88,16 +66,12 @@ type Options struct {
 	shards               uint32
 	cacheTTL             time.Duration
 	ttlJitter            time.Duration
-	fallbackTTL          time.Duration
-	cooldown             time.Duration
+	staleTTL             time.Duration
 	loadWaitTTL          time.Duration
 	negativeTTL          time.Duration
-	fallbackTTLSet       bool
-	cooldownSet          bool
 	loadWaitTTLSet       bool
 	negativeTTLSet       bool
 	negativeCacheEnabled bool
-	autoPolicy           AutoSwitchPolicy
 	filterRefresh        time.Duration
 }
 
@@ -159,24 +133,16 @@ func WithRandomTTL(baseTTL, jitter time.Duration) Option {
 	}
 }
 
-func WithFallbackTTL(ttl time.Duration) Option {
-	return func(o *Options) {
-		o.fallbackTTL = ttl
-		o.fallbackTTLSet = true
-	}
-}
-
-func WithSwitchCooldown(cooldown time.Duration) Option {
-	return func(o *Options) {
-		o.cooldown = cooldown
-		o.cooldownSet = true
-	}
-}
-
 func WithSingleflightWaitTTL(ttl time.Duration) Option {
 	return func(o *Options) {
 		o.loadWaitTTL = ttl
 		o.loadWaitTTLSet = true
+	}
+}
+
+func WithStaleWhileRevalidate(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.staleTTL = ttl
 	}
 }
 
@@ -185,12 +151,6 @@ func WithNegativeCache(ttl time.Duration) Option {
 		o.negativeTTL = ttl
 		o.negativeTTLSet = true
 		o.negativeCacheEnabled = ttl > 0
-	}
-}
-
-func WithAutoSwitchByMissRate(policy AutoSwitchPolicy) Option {
-	return func(o *Options) {
-		o.autoPolicy = policy
 	}
 }
 
@@ -225,26 +185,6 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		}
 	}
 
-	fallbackTTL := options.fallbackTTL
-	if !options.fallbackTTLSet {
-		fallbackTTL = 90 * time.Second
-	}
-
-	cooldown := options.cooldown
-	if !options.cooldownSet {
-		cooldown = 30 * time.Second
-	}
-
-	mode := CacheModeUnsharded
-	if options.useShards {
-		mode = CacheModeSharded
-	}
-
-	shardCount := options.shards
-	if shardCount == 0 {
-		shardCount = 256
-	}
-
 	mu.Lock()
 	defer mu.Unlock()
 	g := &Group{
@@ -252,7 +192,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		getter:               getter,
 		incrementer:          options.incrementer,
 		incrementLocks:       newStripedLocks(defaultIncrementLockStripes),
-		router:               newCacheRouter(mainCache, mode, fallbackTTL, cooldown, cacheBytes, options.onEvicted, shardCount, options.autoPolicy),
+		mainCache:            mainCache,
 		loader:               &singleflight.Group{},
 		singleflightWaitTTL:  options.loadWaitTTL,
 		negativeTTL:          options.negativeTTL,
@@ -262,6 +202,22 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 		janitor:              options.Janitor,
 		cacheTTL:             options.cacheTTL,
 		cacheTTLJitter:       options.ttlJitter,
+		staleTTL:             options.staleTTL,
+	}
+	if g.staleTTL > 0 && g.cacheTTL > 0 {
+		if options.useShards {
+			shards := options.shards
+			if shards == 0 {
+				shards = 256
+			}
+			perShardBytes := cacheBytes / int64(shards)
+			if perShardBytes <= 0 {
+				perShardBytes = 1
+			}
+			g.staleCache = newShardedCache(0, shards, perShardBytes, nil)
+		} else {
+			g.staleCache = &cache{cacheBytes: cacheBytes}
+		}
 	}
 	if g.janitor != nil {
 		go g.janitor.Run(g)

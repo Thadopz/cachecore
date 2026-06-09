@@ -2,6 +2,7 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 
 const baseURL = __ENV.BASE_URL || 'http://localhost:9999';
+const targetPath = __ENV.TARGET_PATH || '/api';
 const mode = __ENV.MODE || 'mixed';
 const hotKey = __ENV.HOT_KEY || 'Tom';
 const seededMax = Number(__ENV.SEEDED_MAX || 100);
@@ -43,8 +44,36 @@ function pickKey() {
 }
 
 export default function () {
+  if (targetPath === '/ping') {
+    const res = http.get(`${baseURL}${targetPath}`);
+    check(res, {
+      'status is 200': (r) => r.status === 200,
+      'body is not empty': (r) => !!r.body && r.body.length > 0,
+    });
+    sleep(Number(__ENV.SLEEP_SECONDS || 0));
+    return;
+  }
+
+  if (targetPath === '/_goCache/get') {
+    const body = String.fromCharCode(
+      0x0a, 0x06, 0x73, 0x63, 0x6f, 0x72, 0x65, 0x73,
+      0x12, 0x03, 0x54, 0x6f, 0x6d,
+    );
+    const res = http.post(`${baseURL}${targetPath}`, body, {
+      headers: { 'Content-Type': 'application/x-protobuf' },
+    });
+
+    check(res, {
+      'status is 200': (r) => r.status === 200,
+      'body is not empty': (r) => !!r.body && r.body.length > 0,
+    });
+
+    sleep(Number(__ENV.SLEEP_SECONDS || 0));
+    return;
+  }
+
   const key = pickKey();
-  const res = http.get(`${baseURL}/api?key=${encodeURIComponent(key)}`);
+  const res = http.get(`${baseURL}${targetPath}?key=${encodeURIComponent(key)}`);
 
   check(res, {
     'status is 200': (r) => r.status === 200,

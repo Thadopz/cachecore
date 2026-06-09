@@ -82,28 +82,15 @@ go tool pprof -top .\\server.exe test-logs\\pprof\\heap-*.pb.gz
 
 说明：`main/main.go` 已导入 `net/http/pprof`，因此 API 服务会暴露 `/debug/pprof/*`。
 
-## 4) Dynamic Strategy Notes
+## 4) Static Strategy Notes
 
-No-popup dynamic strategy comparison benchmark:
+No-popup static strategy comparison benchmark:
 
 ```powershell
 go test .\main -run '^$' -bench BenchmarkStrategyComparisonNoPopup -benchmem -benchtime=3s
 ```
 
-Current default dynamic switching parameters in `main/main.go`:
-
-- `switch-interval=3s`
-- `miss-high=0.45`
-- `miss-low=0.08`
-- `high-consecutive=3`
-- `low-consecutive=6`
-- `fallback-ttl=120s`
-- `switch-cooldown=90s`
-
-These defaults are intentionally conservative so the dynamic strategy avoids frequent flapping and stays closer to the best observed `static-sharded` baseline under mixed load.
-
 Operational recommendation:
 
 - Use `-strategy=sharded` as the default production choice.
 - Use `-strategy=unsharded` only for explicit baseline comparison.
-- Treat `-strategy=dynamic` as an experimental mode for research and tuning, not the recommended default path.

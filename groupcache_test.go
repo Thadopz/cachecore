@@ -355,49 +355,113 @@ func TestGroupGetSingleflightWaitTTLTimeout(t *testing.T) {
 	}
 }
 
-func TestLoadSingleflightWaitTTLServesFallback(t *testing.T) {
+func TestGroupGetSingleflightWaitTTLServesStaleWhileRevalidating(t *testing.T) {
 	var calls int32
-	var slowMode int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var refreshOnce sync.Once
 
-	g := NewGroup("test-singleflight-wait-fallback", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		if atomic.LoadInt32(&slowMode) == 1 {
-			time.Sleep(80 * time.Millisecond)
-			return []byte("v2"), nil
+	g := NewGroup("test-singleflight-swr-stale", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			return []byte("old"), nil
 		}
-		return []byte("v1"), nil
-	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0), WithSingleflightWaitTTL(15*time.Millisecond))
+		refreshOnce.Do(func() { close(refreshStarted) })
+		<-releaseRefresh
+		return []byte("new"), nil
+	}), WithRandomTTL(20*time.Millisecond, 0), WithSingleflightWaitTTL(10*time.Millisecond), WithStaleWhileRevalidate(200*time.Millisecond))
+
+	v, err := g.Get(context.Background(), "Tom")
+	if err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if got := v.String(); got != "old" {
+		t.Fatalf("unexpected first value: got %s, want old", got)
+	}
+
+	time.Sleep(35 * time.Millisecond)
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := g.Get(context.Background(), "Tom")
+		refreshDone <- err
+	}()
+	<-refreshStarted
+
+	v, err = g.Get(context.Background(), "Tom")
+	if err != nil {
+		t.Fatalf("timeout during refresh should serve stale value: %v", err)
+	}
+	if got := v.String(); got != "old" {
+		t.Fatalf("unexpected stale value: got %s, want old", got)
+	}
+
+	close(releaseRefresh)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refresh trigger should receive stale value instead of failing: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		v, err = g.Get(context.Background(), "Tom")
+		if err == nil && v.String() == "new" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for refreshed value, last value=%q err=%v", v.String(), err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("SWR should not amplify loader calls: got %d", got)
+	}
+}
+
+func TestGroupGetSingleflightWaitTTLDoesNotServeExpiredStale(t *testing.T) {
+	var calls int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var refreshOnce sync.Once
+
+	g := NewGroup("test-singleflight-swr-expired", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			return []byte("old"), nil
+		}
+		refreshOnce.Do(func() { close(refreshStarted) })
+		<-releaseRefresh
+		return []byte("new"), nil
+	}), WithRandomTTL(20*time.Millisecond, 0), WithSingleflightWaitTTL(10*time.Millisecond), WithStaleWhileRevalidate(25*time.Millisecond))
 
 	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("warm get failed: %v", err)
-	}
-	if err := g.SwitchToSharded(8); err != nil {
-		t.Fatalf("switch to sharded failed: %v", err)
+		t.Fatalf("first get failed: %v", err)
 	}
 
-	atomic.StoreInt32(&slowMode, 1)
-	firstDone := make(chan error, 1)
+	time.Sleep(70 * time.Millisecond)
+	refreshDone := make(chan error, 1)
 	go func() {
-		_, err := g.load(context.Background(), "Tom")
-		firstDone <- err
+		_, err := g.Get(context.Background(), "Tom")
+		refreshDone <- err
 	}()
+	<-refreshStarted
 
-	time.Sleep(5 * time.Millisecond)
-	v, err := g.load(context.Background(), "Tom")
-	if err != nil {
-		t.Fatalf("second load should degrade to fallback, got err=%v", err)
-	}
-	if got := v.String(); got != "v1" {
-		t.Fatalf("expected fallback value v1, got %s", got)
+	v, err := g.Get(context.Background(), "Tom")
+	if !errors.Is(err, ErrSingleflightWaitTimeout) {
+		t.Fatalf("expected stale window to expire, got value=%q err=%v", v.String(), err)
 	}
 
-	err = <-firstDone
-	if err != nil {
-		t.Fatalf("first load failed: %v", err)
-	}
+	close(releaseRefresh)
+	<-refreshDone
 
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("expected 2 total getter calls (warm + one inflight), got %d", got)
+	deadline := time.Now().Add(time.Second)
+	for {
+		v, err = g.Get(context.Background(), "Tom")
+		if err == nil && v.String() == "new" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for refreshed value, last value=%q err=%v", v.String(), err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -554,317 +618,6 @@ func TestFilterRefreshRebuildsFromWarmupKeys(t *testing.T) {
 		t.Fatalf("filter refresh should rerun warmup getters, got %d calls", got)
 	}
 	t.Fatalf("filter refresh did not publish a ready rebuild for warmup keys")
-}
-
-func TestSwitchToShardedReadsFromFallbackAndRefillsActive(t *testing.T) {
-	var calls int32
-	g := NewGroup("test-switch-fallback-refill", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		return []byte("v-" + key), nil
-	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("warm get failed: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("unexpected getter calls before switch: got %d, want 1", got)
-	}
-
-	if err := g.SwitchToSharded(8); err != nil {
-		t.Fatalf("switch to sharded failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeSharded {
-		t.Fatalf("unexpected mode after switch: got %v, want sharded", mode)
-	}
-
-	v, err := g.Get(context.Background(), "Tom")
-	if err != nil {
-		t.Fatalf("get after switch failed: %v", err)
-	}
-	if got := v.String(); got != "v-Tom" {
-		t.Fatalf("unexpected value after switch: got %s, want v-Tom", got)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("fallback read should not call getter again: got %d, want 1", got)
-	}
-
-	g.router.mu.RLock()
-	active := g.router.active
-	g.router.mu.RUnlock()
-	if active == nil {
-		t.Fatalf("active cache should exist")
-	}
-	if _, ok := active.get("Tom"); !ok {
-		t.Fatalf("active cache should be refilled after fallback hit")
-	}
-}
-
-func TestFallbackRefillSkippedWhenVersionOutdated(t *testing.T) {
-	var calls int32
-	g := NewGroup("test-fallback-version-compare", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		return []byte("v-" + key), nil
-	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("warm get failed: %v", err)
-	}
-	if err := g.SwitchToSharded(8); err != nil {
-		t.Fatalf("switch to sharded failed: %v", err)
-	}
-
-	// Simulate a newer cache generation so the fallback entry epoch becomes stale.
-	g.router.mu.Lock()
-	g.router.fallbackEpoch++
-	g.router.mu.Unlock()
-
-	v, err := g.Get(context.Background(), "Tom")
-	if err != nil {
-		t.Fatalf("get after version advance failed: %v", err)
-	}
-	if got := v.String(); got != "v-Tom" {
-		t.Fatalf("unexpected value from fallback: got %s, want v-Tom", got)
-	}
-
-	g.router.mu.RLock()
-	active := g.router.active
-	g.router.mu.RUnlock()
-	if active == nil {
-		t.Fatalf("active cache should exist")
-	}
-	if _, ok := active.get("Tom"); ok {
-		t.Fatalf("stale fallback should not refill active cache")
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("getter should not be called for fallback hit: got %d, want 1", got)
-	}
-}
-
-func TestFallbackExpiresAndCleanupStopsServingOldCache(t *testing.T) {
-	var calls int32
-	g := NewGroup("test-fallback-expire", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		return []byte("v"), nil
-	}), WithFallbackTTL(30*time.Millisecond), WithSwitchCooldown(0))
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("warm get failed: %v", err)
-	}
-	if err := g.SwitchToSharded(4); err != nil {
-		t.Fatalf("switch to sharded failed: %v", err)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	g.CleanupFallback()
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("get after fallback cleanup failed: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("getter should be called again after fallback expiry: got %d, want 2", got)
-	}
-}
-
-func TestFallbackTTLZeroNeverServesFallback(t *testing.T) {
-	var calls int32
-	g := NewGroup("test-fallback-ttl-zero", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		return []byte("v"), nil
-	}), WithFallbackTTL(0), WithSwitchCooldown(0))
-	if g.router.fallbackTTL != 0 {
-		t.Fatalf("unexpected fallbackTTL: got %v, want 0", g.router.fallbackTTL)
-	}
-	if mode := g.Mode(); mode != CacheModeUnsharded {
-		t.Fatalf("unexpected initial mode: got %v, want unsharded", mode)
-	}
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("warm get failed: %v", err)
-	}
-	if err := g.SwitchToSharded(4); err != nil {
-		t.Fatalf("switch to sharded failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeSharded {
-		t.Fatalf("unexpected mode after switch: got %v, want sharded", mode)
-	}
-
-	active, fallback := g.currentCaches()
-	if fallback != nil {
-		t.Fatalf("fallback should be disabled when fallbackTTL is 0")
-	}
-	if active == nil {
-		t.Fatalf("active cache should exist")
-	}
-	if _, ok := active.get("Tom"); ok {
-		t.Fatalf("new active cache should be cold right after switch")
-	}
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("get after switch failed: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("getter should be called again when fallbackTTL is 0: got %d, want 2", got)
-	}
-}
-
-func TestInvalidateRemovesFromActiveAndFallback(t *testing.T) {
-	var calls int32
-	g := NewGroup("test-invalidate-active-fallback", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		return []byte("x"), nil
-	}), WithFallbackTTL(2*time.Second), WithSwitchCooldown(0))
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("warm get failed: %v", err)
-	}
-	if err := g.SwitchToSharded(4); err != nil {
-		t.Fatalf("switch to sharded failed: %v", err)
-	}
-
-	g.Invalidate("Tom")
-
-	if _, err := g.Get(context.Background(), "Tom"); err != nil {
-		t.Fatalf("get after invalidate failed: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("getter should be called again after invalidate: got %d, want 2", got)
-	}
-}
-
-func TestSwitchRespectsCooldown(t *testing.T) {
-	g := NewGroup("test-switch-cooldown", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		return []byte("ok"), nil
-	}), WithSwitchCooldown(150*time.Millisecond), WithFallbackTTL(time.Second))
-
-	if err := g.SwitchToSharded(8); err != nil {
-		t.Fatalf("first switch to sharded failed: %v", err)
-	}
-	if err := g.SwitchToUnsharded(); !errors.Is(err, ErrSwitchCooldown) {
-		t.Fatalf("expected ErrSwitchCooldown, got: %v", err)
-	}
-
-	time.Sleep(170 * time.Millisecond)
-	if err := g.SwitchToUnsharded(); err != nil {
-		t.Fatalf("switch to unsharded after cooldown failed: %v", err)
-	}
-}
-
-func TestAutoSwitchByMissRateHysteresis(t *testing.T) {
-	g := NewGroup("test-auto-switch-hysteresis", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		return []byte("ok"), nil
-	}),
-		WithSwitchCooldown(0),
-		WithAutoSwitchByMissRate(AutoSwitchPolicy{
-			Enable:          true,
-			MissRateHigh:    0.7,
-			MissRateLow:     0.3,
-			HighConsecutive: 2,
-			LowConsecutive:  2,
-		}),
-	)
-
-	if mode := g.Mode(); mode != CacheModeUnsharded {
-		t.Fatalf("unexpected initial mode: got %v, want unsharded", mode)
-	}
-
-	if err := g.EvaluateAutoSwitchOnce(0.8); err != nil {
-		t.Fatalf("first high miss evaluation failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeUnsharded {
-		t.Fatalf("mode should stay unsharded before high threshold streak: got %v", mode)
-	}
-
-	if err := g.EvaluateAutoSwitchOnce(0.85); err != nil {
-		t.Fatalf("second high miss evaluation failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeSharded {
-		t.Fatalf("mode should switch to sharded after high streak: got %v", mode)
-	}
-
-	if err := g.EvaluateAutoSwitchOnce(0.5); err != nil {
-		t.Fatalf("mid miss evaluation failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeSharded {
-		t.Fatalf("mode should stay sharded in hysteresis band: got %v", mode)
-	}
-
-	if err := g.EvaluateAutoSwitchOnce(0.2); err != nil {
-		t.Fatalf("first low miss evaluation failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeSharded {
-		t.Fatalf("mode should stay sharded before low threshold streak: got %v", mode)
-	}
-
-	if err := g.EvaluateAutoSwitchOnce(0.1); err != nil {
-		t.Fatalf("second low miss evaluation failed: %v", err)
-	}
-	if mode := g.Mode(); mode != CacheModeUnsharded {
-		t.Fatalf("mode should switch back to unsharded after low streak: got %v", mode)
-	}
-}
-
-func TestConcurrentGetDuringSwitch(t *testing.T) {
-	var calls int32
-	g := NewGroup("test-concurrent-get-switch", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-		atomic.AddInt32(&calls, 1)
-		return []byte("v-" + key), nil
-	}), WithFallbackTTL(time.Second), WithSwitchCooldown(0))
-
-	keys := []string{"k1", "k2", "k3", "k4", "k5"}
-
-	stop := make(chan struct{})
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			idx := worker
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				key := keys[idx%len(keys)]
-				idx++
-				v, err := g.Get(context.Background(), key)
-				if err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				if v.String() == "" {
-					select {
-					case errCh <- fmt.Errorf("empty value for key=%s", key):
-					default:
-					}
-					return
-				}
-			}
-		}(i)
-	}
-
-	for i := 0; i < 50; i++ {
-		if i%2 == 0 {
-			_ = g.SwitchToSharded(8)
-		} else {
-			_ = g.SwitchToUnsharded()
-		}
-	}
-
-	close(stop)
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			t.Fatalf("concurrent get during switch failed: %v", err)
-		}
-	}
 }
 
 func TestNegativeCacheCachesNotFound(t *testing.T) {

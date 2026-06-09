@@ -26,8 +26,8 @@ type Group struct {
 	incrementer    Incrementer
 	incrementLocks *stripedLocks
 
-	// router owns active/fallback cache state and mode switching.
-	router *cacheRouter
+	// mainCache stores this group's local cached values.
+	mainCache Cache
 
 	// peers is used to pick a peer to get the value for a key.
 	// It is set by RegisterPeers and should not be nil after that.
@@ -58,6 +58,13 @@ type Group struct {
 	// to avoid synchronized expirations.
 	cacheTTLJitter time.Duration
 
+	// staleCache keeps successful values beyond their active TTL for timeout
+	// fallback while an async singleflight refresh is still running.
+	staleCache Cache
+
+	// staleTTL is the extra duration a value can be served after active TTL expiry.
+	staleTTL time.Duration
+
 	// negativeCacheEnabled controls whether ErrNotFound is cached for a short TTL.
 	negativeCacheEnabled bool
 
@@ -82,7 +89,7 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
 	Stats.IncGroupGets()
-	active, fallback := g.currentCaches()
+	active := g.mainCache
 	if active != nil {
 		if v, ok := active.get(key); ok {
 			Stats.IncCacheHits()
@@ -92,24 +99,8 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 			return v, nil
 		}
 	}
-	if fallback != nil {
-		if v, ok := fallback.get(key); ok {
-			Stats.IncCacheHits()
-			if g.shouldRefillFromFallback(v) {
-				g.tryRefillActiveFromFallback(key, v)
-			}
-			if v.isNotFound() {
-				return ByteView{}, ErrNotFound
-			}
-			return v, nil
-		}
-	}
 	Stats.IncCacheMisses()
 	return g.load(ctx, key)
-}
-
-func (g *Group) currentCaches() (active Cache, fallback Cache) {
-	return g.router.currentCaches()
 }
 
 func (g *Group) Increment(ctx context.Context, key string, delta int64) (int64, error) {
@@ -158,19 +149,18 @@ func (g *Group) incrementLocally(ctx context.Context, key string, delta int64) (
 		return 0, err
 	}
 
-	active, fallback := g.currentCaches()
+	active := g.mainCache
 	if active == nil {
 		return 0, ErrIncrementUnsupported
 	}
 
 	if g.incrementer == nil {
-		next, err := active.increment(key, delta, g.nextTTL(), g.stampActiveValue)
+		ttl := g.nextTTL()
+		next, err := active.increment(key, delta, ttl, g.stampActiveValue)
 		if err != nil {
 			return 0, err
 		}
-		if fallback != nil {
-			fallback.remove(key)
-		}
+		g.recordStale(key, g.stampActiveValue([]byte(strconv.FormatInt(next, 10))), ttl)
 		g.filter.add(key)
 		return next, nil
 	}
@@ -178,7 +168,7 @@ func (g *Group) incrementLocally(ctx context.Context, key string, delta int64) (
 	unlock := g.incrementLocks.lock(key)
 	defer unlock()
 
-	active, fallback = g.currentCaches()
+	active = g.mainCache
 	if active == nil {
 		return 0, ErrIncrementUnsupported
 	}
@@ -193,9 +183,7 @@ func (g *Group) incrementLocally(ctx context.Context, key string, delta int64) (
 	} else {
 		active.add(key, value)
 	}
-	if fallback != nil {
-		fallback.remove(key)
-	}
+	g.recordStale(key, value, ttl)
 	g.filter.add(key)
 	return next, nil
 }
@@ -216,7 +204,7 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 					return value, nil
 				} else if errors.Is(err, ErrNotFound) {
 					if g.negativeCacheEnabled && g.negativeTTL > 0 {
-						active, _ := g.currentCaches()
+						active := g.mainCache
 						if active != nil {
 							negativeValue := g.stampActiveValue(nil).withNotFound()
 							active.addWithTTL(key, negativeValue, g.negativeTTL)
@@ -252,36 +240,34 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	case <-ctx.Done():
 		return ByteView{}, ctx.Err()
 	case <-timer.C:
-		if v, ok := g.degradeFromCaches(key); ok {
-			g.Log("singleflight wait timeout key=%s, fallback served", key)
+		if v, stale, ok := g.degradeFromCaches(key); ok {
+			if stale {
+				g.Log("singleflight wait timeout key=%s, stale value served", key)
+			} else {
+				g.Log("singleflight wait timeout key=%s, cached value served", key)
+			}
 			if v.isNotFound() {
 				return ByteView{}, ErrNotFound
 			}
 			return v, nil
 		}
-		g.Log("singleflight wait timeout key=%s, no fallback", key)
+		g.Log("singleflight wait timeout key=%s, no cached value", key)
 		return ByteView{}, ErrSingleflightWaitTimeout
 	}
 }
 
-func (g *Group) degradeFromCaches(key string) (ByteView, bool) {
-	active, fallback := g.currentCaches()
+func (g *Group) degradeFromCaches(key string) (ByteView, bool, bool) {
+	active := g.mainCache
 	if active != nil {
 		if v, ok := active.get(key); ok {
 			Stats.IncCacheHits()
-			return v, true
+			return v, false, true
 		}
 	}
-	if fallback != nil {
-		if v, ok := fallback.get(key); ok {
-			Stats.IncCacheHits()
-			if g.shouldRefillFromFallback(v) {
-				g.tryRefillActiveFromFallback(key, v)
-			}
-			return v, true
-		}
+	if v, ok := g.getStale(key); ok {
+		return v, true, true
 	}
-	return ByteView{}, false
+	return ByteView{}, false, false
 }
 
 func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (ByteView, error) {
@@ -297,7 +283,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 	}
 	value := g.stampActiveValue(cloneBytes(response.Value))
 	ttl := g.nextTTL()
-	active, _ := g.currentCaches()
+	active := g.mainCache
 	if active != nil {
 		if ttl > 0 {
 			active.addWithTTL(key, value, ttl)
@@ -305,6 +291,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer PeerGetter, key string) (B
 			active.add(key, value)
 		}
 	}
+	g.recordStale(key, value, ttl)
 	g.filter.add(key)
 	return value, nil
 }
@@ -318,7 +305,7 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
 		if g.negativeCacheEnabled && g.negativeTTL > 0 && errors.Is(err, ErrNotFound) {
-			active, _ := g.currentCaches()
+			active := g.mainCache
 			if active != nil {
 				negativeValue := g.stampActiveValue(nil).withNotFound()
 				active.addWithTTL(key, negativeValue, g.negativeTTL)
@@ -329,7 +316,7 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	Stats.IncLocalLoads()
 	value := g.stampActiveValue(cloneBytes(bytes))
 	ttl := g.nextTTL()
-	active, _ := g.currentCaches()
+	active := g.mainCache
 	if active == nil {
 		return value, nil
 	}
@@ -338,6 +325,7 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	} else {
 		active.add(key, value)
 	}
+	g.recordStale(key, value, ttl)
 	g.filter.add(key)
 	return value, nil
 }
@@ -363,6 +351,24 @@ func (g *Group) nextTTL() time.Duration {
 	return ttl
 }
 
+func (g *Group) recordStale(key string, value ByteView, activeTTL time.Duration) {
+	if g.staleCache == nil || g.staleTTL <= 0 || activeTTL <= 0 || value.isNotFound() {
+		return
+	}
+	g.staleCache.addWithTTL(key, value, activeTTL+g.staleTTL)
+}
+
+func (g *Group) getStale(key string) (ByteView, bool) {
+	if g.staleCache == nil || g.staleTTL <= 0 {
+		return ByteView{}, false
+	}
+	if v, ok := g.staleCache.get(key); ok {
+		Stats.IncCacheHits()
+		return v, true
+	}
+	return ByteView{}, false
+}
+
 func (g *Group) getLocallyOnlyForWarmUp(ctx context.Context, key string) (ByteView, error) {
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
@@ -371,6 +377,10 @@ func (g *Group) getLocallyOnlyForWarmUp(ctx context.Context, key string) (ByteVi
 	value := ByteView{b: cloneBytes(bytes)}
 	g.filter.add(key)
 	return value, nil
+}
+
+func (g *Group) stampActiveValue(b []byte) ByteView {
+	return ByteView{b: b}
 }
 
 func (g *Group) RegisterPeers(peers PeerPicker) {
@@ -411,12 +421,12 @@ func (g *Group) Invalidate(key string) {
 }
 
 func (g *Group) invalidateLocal(key string) {
-	active, fallback := g.currentCaches()
+	active := g.mainCache
 	if active != nil {
 		active.remove(key)
 	}
-	if fallback != nil {
-		fallback.remove(key)
+	if g.staleCache != nil {
+		g.staleCache.remove(key)
 	}
 }
 
