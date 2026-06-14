@@ -5,8 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Thadopz/cachecore/internal/consistenthash"
-	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
 	"io"
 	"log"
 	"net"
@@ -15,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Thadopz/cachecore/internal/consistenthash"
+	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -48,6 +48,7 @@ func newPeerHTTPClient() *http.Client {
 	return &http.Client{Transport: transport}
 }
 
+// HTTPPool implements peer selection and HTTP transport for cache groups.
 type HTTPPool struct {
 	self        string
 	basePath    string
@@ -56,6 +57,7 @@ type HTTPPool struct {
 	httpGetters map[string]*httpGetter
 }
 
+// NewHTTPPool creates a peer pool for the local node address.
 func NewHTTPPool(self string) *HTTPPool {
 	return &HTTPPool{
 		self:        self,
@@ -64,6 +66,7 @@ func NewHTTPPool(self string) *HTTPPool {
 	}
 }
 
+// Set replaces the known peer addresses.
 func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -88,6 +91,7 @@ func (p *HTTPPool) pickPeer(key string) (*httpGetter, bool) {
 	return nil, false
 }
 
+// Log writes a formatted pool-scoped log message.
 func (p *HTTPPool) Log(format string, v ...interface{}) {
 	log.Printf("[Server %s] %s", p.self, fmt.Sprintf(format, v...))
 }
@@ -179,10 +183,8 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		code, notFound := classifyPeerGetError(err)
 		writeProtoResponse(w, code, err.Error(), nil, notFound)
 		return
-	} else {
-		writeProtoResponse(w, 0, "", view.ByteSlice(), false)
-		return
 	}
+	writeProtoResponse(w, 0, "", view.ByteSlice(), false)
 }
 
 type httpGetter struct {

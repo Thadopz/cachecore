@@ -4,15 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Thadopz/cachecore/internal/singleflight"
 	"log"
 	"math/rand"
 	"strconv"
 	"time"
 
 	pb "github.com/Thadopz/cachecore/internal/groupcachepb"
+	"github.com/Thadopz/cachecore/internal/singleflight"
 )
 
+// Group is a named cache namespace.
 type Group struct {
 	// name is the name of this group, must be unique and non-empty
 	name string
@@ -72,10 +73,12 @@ type Group struct {
 	negativeTTL time.Duration
 }
 
+// Log writes a formatted group-scoped log message.
 func (g *Group) Log(format string, v ...interface{}) {
 	log.Printf("[Group %s] %s", g.name, fmt.Sprintf(format, v...))
 }
 
+// Get returns a cached or newly loaded value for key.
 func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 	start := time.Now()
 	defer func() {
@@ -103,6 +106,7 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 	return g.load(ctx, key)
 }
 
+// Increment atomically increments the numeric value stored for key.
 func (g *Group) Increment(ctx context.Context, key string, delta int64) (int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -184,7 +188,6 @@ func (g *Group) incrementLocally(ctx context.Context, key string, delta int64) (
 	return next, nil
 }
 
-// if mainCache doesn't have the key, it should return an error, so that the getter can fallback to getFromPeer
 func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -194,22 +197,8 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	}
 	loadCtx := context.WithoutCancel(ctx)
 	loadFn := func() (interface{}, error) {
-		if g.peers != nil {
-			if peer, ok := g.peers.pickPeer(key); ok {
-				if value, err := g.getFromPeer(loadCtx, peer, key); err == nil {
-					return value, nil
-				} else if errors.Is(err, ErrNotFound) {
-					if g.negativeCacheEnabled && g.negativeTTL > 0 {
-						active := g.mainCache
-						if active != nil {
-							negativeValue := g.stampActiveValue(nil).withNotFound()
-							active.addWithTTL(key, negativeValue, g.negativeTTL)
-						}
-					}
-					return ByteView{}, ErrNotFound
-				}
-				g.Log("Failed to get from peer %v: %v", peer, err)
-			}
+		if value, ok, err := g.loadFromPeer(loadCtx, key); ok || err != nil {
+			return value, err
 		}
 		return g.getLocally(loadCtx, key)
 	}
@@ -224,6 +213,42 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	}
 
 	resCh := g.loader.DoChan(key, loadFn)
+	return g.waitForLoad(ctx, key, resCh)
+}
+
+func (g *Group) loadFromPeer(ctx context.Context, key string) (ByteView, bool, error) {
+	if g.peers == nil {
+		return ByteView{}, false, nil
+	}
+	peer, ok := g.peers.pickPeer(key)
+	if !ok {
+		return ByteView{}, false, nil
+	}
+	value, err := g.getFromPeer(ctx, peer, key)
+	if err == nil {
+		return value, true, nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		g.cacheNegative(key)
+		return ByteView{}, true, ErrNotFound
+	}
+	g.Log("Failed to get from peer %v: %v", peer, err)
+	return ByteView{}, false, nil
+}
+
+func (g *Group) cacheNegative(key string) {
+	if !g.negativeCacheEnabled || g.negativeTTL <= 0 {
+		return
+	}
+	active := g.mainCache
+	if active == nil {
+		return
+	}
+	negativeValue := g.stampActiveValue(nil).withNotFound()
+	active.addWithTTL(key, negativeValue, g.negativeTTL)
+}
+
+func (g *Group) waitForLoad(ctx context.Context, key string, resCh <-chan singleflight.Result) (ByteView, error) {
 	timer := time.NewTimer(g.singleflightWaitTTL)
 	defer timer.Stop()
 
@@ -236,20 +261,24 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	case <-ctx.Done():
 		return ByteView{}, ctx.Err()
 	case <-timer.C:
-		if v, stale, ok := g.degradeFromCaches(key); ok {
-			if stale {
-				g.Log("singleflight wait timeout key=%s, stale value served", key)
-			} else {
-				g.Log("singleflight wait timeout key=%s, cached value served", key)
-			}
-			if v.isNotFound() {
-				return ByteView{}, ErrNotFound
-			}
-			return v, nil
-		}
-		g.Log("singleflight wait timeout key=%s, no cached value", key)
-		return ByteView{}, ErrSingleflightWaitTimeout
+		return g.degradeAfterWaitTimeout(key)
 	}
+}
+
+func (g *Group) degradeAfterWaitTimeout(key string) (ByteView, error) {
+	if v, stale, ok := g.degradeFromCaches(key); ok {
+		if stale {
+			g.Log("singleflight wait timeout key=%s, stale value served", key)
+		} else {
+			g.Log("singleflight wait timeout key=%s, cached value served", key)
+		}
+		if v.isNotFound() {
+			return ByteView{}, ErrNotFound
+		}
+		return v, nil
+	}
+	g.Log("singleflight wait timeout key=%s, no cached value", key)
+	return ByteView{}, ErrSingleflightWaitTimeout
 }
 
 func (g *Group) degradeFromCaches(key string) (ByteView, bool, bool) {
@@ -301,11 +330,7 @@ func (g *Group) getLocally(ctx context.Context, key string) (ByteView, error) {
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
 		if g.negativeCacheEnabled && g.negativeTTL > 0 && errors.Is(err, ErrNotFound) {
-			active := g.mainCache
-			if active != nil {
-				negativeValue := g.stampActiveValue(nil).withNotFound()
-				active.addWithTTL(key, negativeValue, g.negativeTTL)
-			}
+			g.cacheNegative(key)
 		}
 		return ByteView{}, err
 	}
@@ -379,6 +404,7 @@ func (g *Group) stampActiveValue(b []byte) ByteView {
 	return ByteView{b: b}
 }
 
+// RegisterPeers registers the HTTP peer pool used for distributed lookups.
 func (g *Group) RegisterPeers(peers *HTTPPool) {
 	if g.peers != nil {
 		panic("RegisterPeers called more than once")
@@ -386,6 +412,7 @@ func (g *Group) RegisterPeers(peers *HTTPPool) {
 	g.peers = peers
 }
 
+// Warmup preloads keys into the configured filter.
 func (g *Group) Warmup(keys []string) {
 	if g.filter == nil {
 		g.Log("No filter set, skipping warmup")
@@ -402,6 +429,7 @@ func (g *Group) Warmup(keys []string) {
 	}
 }
 
+// Invalidate removes key locally and asks peers to remove it as well.
 func (g *Group) Invalidate(key string) {
 	g.invalidateLocal(key)
 	if g.peers == nil {

@@ -2,11 +2,13 @@ package cache
 
 import "time"
 
+// Janitor periodically removes expired entries from a group.
 type Janitor struct {
 	interval time.Duration
 	stop     chan struct{}
 }
 
+// Run starts the cleanup loop for g.
 func (j *Janitor) Run(g *Group) {
 	ticker := time.NewTicker(j.interval)
 	defer ticker.Stop()
@@ -27,6 +29,7 @@ func (j *Janitor) Run(g *Group) {
 	}
 }
 
+// NewJanitor creates a janitor with interval.
 func NewJanitor(interval time.Duration) *Janitor {
 	if interval <= 0 {
 		interval = time.Minute
@@ -37,6 +40,7 @@ func NewJanitor(interval time.Duration) *Janitor {
 	}
 }
 
+// Stop stops the cleanup loop.
 func (j *Janitor) Stop() {
 	if j == nil || j.stop == nil {
 		return
@@ -49,6 +53,7 @@ func (j *Janitor) Stop() {
 	}
 }
 
+// StartFilterRefresh starts periodic filter warmup for the group.
 func (g *Group) StartFilterRefresh(interval time.Duration) {
 	if g.filter == nil {
 		return
@@ -56,6 +61,7 @@ func (g *Group) StartFilterRefresh(interval time.Duration) {
 	g.filter.startRefresh(interval, g.Warmup)
 }
 
+// StopFilterRefresh stops periodic filter refresh for the group.
 func (g *Group) StopFilterRefresh() {
 	g.filter.stopRefresh()
 }

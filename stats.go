@@ -11,6 +11,7 @@ import (
 
 const defaultLatencySampleCap = 8192
 
+// MetricsSnapshot is a point-in-time copy of runtime counters.
 type MetricsSnapshot struct {
 	APIRequests           uint64
 	APIErrors             uint64
@@ -35,6 +36,7 @@ type MetricsSnapshot struct {
 	FilterMisses          uint64
 }
 
+// Metrics stores process-wide cache and API counters.
 type Metrics struct {
 	APIRequests           uint64
 	APIErrors             uint64
@@ -68,6 +70,7 @@ type Metrics struct {
 	cacheGetLatencyWindow  latencyWindow
 }
 
+// Stats is the default process-wide metrics collector.
 var Stats = newMetrics()
 
 func newMetrics() *Metrics {
@@ -139,6 +142,7 @@ func (w *latencyWindow) p95p99AndReset() (uint64, uint64, bool) {
 	return p95, p99, true
 }
 
+// Snapshot returns a point-in-time copy of all metrics.
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
 		APIRequests:           atomic.LoadUint64(&m.APIRequests),
@@ -165,14 +169,17 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	}
 }
 
+// IncAPIRequests increments the API request counter.
 func (m *Metrics) IncAPIRequests() {
 	atomic.AddUint64(&m.APIRequests, 1)
 }
 
+// IncAPIErrors increments the API error counter.
 func (m *Metrics) IncAPIErrors() {
 	atomic.AddUint64(&m.APIErrors, 1)
 }
 
+// RecordAPILatency records one API latency observation.
 func (m *Metrics) RecordAPILatency(d time.Duration) {
 	if d < 0 {
 		return
@@ -185,10 +192,12 @@ func (m *Metrics) RecordAPILatency(d time.Duration) {
 	}
 }
 
+// IncGroupGets increments the group get counter.
 func (m *Metrics) IncGroupGets() {
 	atomic.AddUint64(&m.GroupGets, 1)
 }
 
+// RecordGroupGetLatency records one group get latency observation.
 func (m *Metrics) RecordGroupGetLatency(d time.Duration) {
 	if d < 0 {
 		return
@@ -201,14 +210,17 @@ func (m *Metrics) RecordGroupGetLatency(d time.Duration) {
 	}
 }
 
+// IncCacheHits increments the cache hit counter.
 func (m *Metrics) IncCacheHits() {
 	atomic.AddUint64(&m.CacheHits, 1)
 }
 
+// IncCacheMisses increments the cache miss counter.
 func (m *Metrics) IncCacheMisses() {
 	atomic.AddUint64(&m.CacheMisses, 1)
 }
 
+// RecordCacheGetLatency records one local cache get latency observation.
 func (m *Metrics) RecordCacheGetLatency(d time.Duration) {
 	if d < 0 {
 		return
@@ -221,10 +233,12 @@ func (m *Metrics) RecordCacheGetLatency(d time.Duration) {
 	}
 }
 
+// SetLatencySamplingEnabled enables or disables percentile latency sampling.
 func (m *Metrics) SetLatencySamplingEnabled(enabled bool) {
 	m.latencySamplingEnabled.Store(enabled)
 }
 
+// SetLatencySampleRate sets the fraction of latency observations sampled.
 func (m *Metrics) SetLatencySampleRate(rate float64) {
 	if rate <= 0 {
 		m.latencySamplingEnabled.Store(false)
@@ -253,22 +267,27 @@ func (m *Metrics) shouldSampleLatency(counter *uint64) bool {
 	return atomic.AddUint64(counter, 1)%every == 0
 }
 
+// IncPeerLoads increments the peer load counter.
 func (m *Metrics) IncPeerLoads() {
 	atomic.AddUint64(&m.PeerLoads, 1)
 }
 
+// IncLocalLoads increments the local load counter.
 func (m *Metrics) IncLocalLoads() {
 	atomic.AddUint64(&m.LocalLoads, 1)
 }
 
+// IncPeerHTTPRequests increments the peer HTTP request counter.
 func (m *Metrics) IncPeerHTTPRequests() {
 	atomic.AddUint64(&m.PeerHTTPRequests, 1)
 }
 
+// IncFilterMisses increments the filter miss counter.
 func (m *Metrics) IncFilterMisses() {
 	atomic.AddUint64(&m.FilterMisses, 1)
 }
 
+// StartLogger periodically logs metric summaries.
 func (m *Metrics) StartLogger(interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Second * 5
@@ -348,6 +367,7 @@ func (m *Metrics) StartLogger(interval time.Duration) {
 	}
 }
 
+// SatisLogger is a compatibility alias for StartLogger.
 func (m *Metrics) SatisLogger(interval time.Duration) {
 	m.StartLogger(interval)
 }

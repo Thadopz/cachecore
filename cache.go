@@ -9,6 +9,7 @@ import (
 	"github.com/Thadopz/cachecore/internal/lru"
 )
 
+// Cache defines the local storage operations used by a Group.
 type Cache interface {
 	add(key string, value ByteView)
 	addWithTTL(key string, value ByteView, ttl time.Duration)

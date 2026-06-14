@@ -11,12 +11,14 @@ const (
 	defaultHashCount  = 6
 )
 
+// BloomFilter is a thread-safe Bloom filter.
 type BloomFilter struct {
 	arr []uint32
 	k   uint32
 	mu  sync.RWMutex
 }
 
+// New creates a Bloom filter with m bits and k hash functions.
 func New(m, k int) *BloomFilter {
 	if m <= 0 {
 		m = defaultBitsetSize
@@ -30,10 +32,12 @@ func New(m, k int) *BloomFilter {
 	}
 }
 
+// NewDefault creates a Bloom filter with default sizing.
 func NewDefault() *BloomFilter {
 	return New(defaultBitsetSize, defaultHashCount)
 }
 
+// Add inserts item into the filter.
 func (bf *BloomFilter) Add(item string) {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()
@@ -45,6 +49,7 @@ func (bf *BloomFilter) Add(item string) {
 	}
 }
 
+// Contains reports whether item may exist in the filter.
 func (bf *BloomFilter) Contains(item string) bool {
 	bf.mu.RLock()
 	defer bf.mu.RUnlock()
@@ -59,6 +64,7 @@ func (bf *BloomFilter) Contains(item string) bool {
 	return true
 }
 
+// Reset clears all filter bits.
 func (bf *BloomFilter) Reset() {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()

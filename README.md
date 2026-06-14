@@ -1,5 +1,7 @@
 # cachecore
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/Thadopz/cachecore)](https://goreportcard.com/report/github.com/Thadopz/cachecore)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 `cachecore` is a Go distributed cache library and demo server inspired by

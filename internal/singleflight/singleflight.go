@@ -5,6 +5,7 @@ import (
 	"sync"
 )
 
+// Result is the outcome of a shared call.
 type Result struct {
 	Val interface{}
 	Err error
@@ -17,11 +18,13 @@ type call struct {
 	chs []chan Result
 }
 
+// Group suppresses duplicate function calls by key.
 type Group struct {
 	mu sync.Mutex
 	m  map[string]*call
 }
 
+// Do runs fn once for concurrent callers sharing key.
 func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
 	g.mu.Lock()
 	if g.m == nil {
@@ -42,6 +45,7 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 	return c.val, c.err
 }
 
+// DoChan runs fn once and returns a channel for the shared result.
 func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
 	ch := make(chan Result, 1)
 

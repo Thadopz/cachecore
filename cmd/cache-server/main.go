@@ -93,19 +93,25 @@ func syntheticValue(key string) ([]byte, bool) {
 	return nil, false
 }
 
-func createGroup(strategy string, shards uint, enableFilter bool, filterSize int, filterHashes int, filterRefresh time.Duration, redisAddr string, backend string, cacheBytes int64, evictionLog bool) *groupcache.Group {
+func normalizeBackend(backend string) string {
 	backend = strings.ToLower(strings.TrimSpace(backend))
 	if backend == "" {
-		backend = "demo"
+		return "demo"
 	}
+	return backend
+}
 
+func newRedisClient(redisAddr string, backend string) *redis.Client {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	if backend != "synthetic" {
 		if err := rdb.Ping(context.Background()).Err(); err != nil {
 			log.Printf("[Redis] ping failed, fallback to db only: %v", err)
 		}
 	}
+	return rdb
+}
 
+func createGroupOptions(strategy string, shards uint, enableFilter bool, filterSize int, filterHashes int, filterRefresh time.Duration, backend string, evictionLog bool, rdb *redis.Client) []groupcache.Option {
 	opts := []groupcache.Option{}
 	if evictionLog {
 		opts = append(opts, groupcache.WithOnEvicted(func(key string, value groupcache.ByteView) {
@@ -113,14 +119,7 @@ func createGroup(strategy string, shards uint, enableFilter bool, filterSize int
 		}))
 	}
 	if backend != "synthetic" {
-		opts = append(opts, groupcache.WithIncrementer(groupcache.IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			defer cancel()
-			return rdb.IncrBy(redisCtx, key, delta).Result()
-		})))
+		opts = append(opts, groupcache.WithIncrementer(newRedisIncrementer(rdb)))
 	}
 	if enableFilter {
 		opts = append(opts, groupcache.WithFilter(bloomfilter.New(filterSize, filterHashes)))
@@ -128,56 +127,83 @@ func createGroup(strategy string, shards uint, enableFilter bool, filterSize int
 			opts = append(opts, groupcache.WithFilterRefresh(filterRefresh))
 		}
 	}
+	return appendStrategyOptions(opts, strategy, shards)
+}
 
+func appendStrategyOptions(opts []groupcache.Option, strategy string, shards uint) []groupcache.Option {
 	switch strings.ToLower(strategy) {
 	case "sharded":
-		opts = append(opts, groupcache.WithShardedCache(uint32(shards)))
+		return append(opts, groupcache.WithShardedCache(uint32(shards)))
 	case "unsharded":
-		// unsharded requires no extra option.
+		return opts
 	case "slru":
-		opts = append(opts, groupcache.WithSLRU(0.8))
+		return append(opts, groupcache.WithSLRU(0.8))
 	case "sharded-slru":
-		opts = append(opts, groupcache.WithShardedCache(uint32(shards)), groupcache.WithSLRU(0.8))
+		return append(opts, groupcache.WithShardedCache(uint32(shards)), groupcache.WithSLRU(0.8))
 	default:
 		log.Fatalf("invalid cache strategy %q: use sharded, unsharded, slru, or sharded-slru", strategy)
 	}
+	return opts
+}
 
-	g := groupcache.NewGroup("scores", cacheBytes, groupcache.GetterFunc(
-		func(ctx context.Context, key string) ([]byte, error) {
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			if backend == "synthetic" {
-				if value, ok := syntheticValue(key); ok {
-					return value, nil
-				}
-				return nil, groupcache.ErrNotFound
-			}
-			if backend != "demo" {
-				return nil, groupcache.ErrNotFound
-			}
-			redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			defer cancel()
+func newRedisIncrementer(rdb *redis.Client) groupcache.IncrementerFunc {
+	return func(ctx context.Context, key string, delta int64) (int64, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+		return rdb.IncrBy(redisCtx, key, delta).Result()
+	}
+}
 
-			if value, err := rdb.Get(redisCtx, key).Result(); err == nil {
-				return []byte(value), nil
-			} else if !errors.Is(err, redis.Nil) {
-				log.Printf("[Redis] GET failed for key=%s: %v", key, err)
-			}
-
-			log.Println("[SlowDB] search key", key)
-			if v, ok := db[key]; ok {
-				if err := rdb.Set(redisCtx, key, v, 0).Err(); err != nil {
-					log.Printf("[Redis] SET failed for key=%s: %v", key, err)
-				}
-				return []byte(v), nil
-			}
+func newGroupGetter(rdb *redis.Client, backend string) groupcache.GetterFunc {
+	return func(ctx context.Context, key string) ([]byte, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if backend == "synthetic" {
+			return getSyntheticValue(key)
+		}
+		if backend != "demo" {
 			return nil, groupcache.ErrNotFound
-		}),
-		opts...,
-	)
+		}
+		return getDemoValue(ctx, rdb, key)
+	}
+}
 
-	return g
+func getSyntheticValue(key string) ([]byte, error) {
+	if value, ok := syntheticValue(key); ok {
+		return value, nil
+	}
+	return nil, groupcache.ErrNotFound
+}
+
+func getDemoValue(ctx context.Context, rdb *redis.Client, key string) ([]byte, error) {
+	redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	if value, err := rdb.Get(redisCtx, key).Result(); err == nil {
+		return []byte(value), nil
+	} else if !errors.Is(err, redis.Nil) {
+		log.Printf("[Redis] GET failed for key=%s: %v", key, err)
+	}
+
+	log.Println("[SlowDB] search key", key)
+	if v, ok := db[key]; ok {
+		if err := rdb.Set(redisCtx, key, v, 0).Err(); err != nil {
+			log.Printf("[Redis] SET failed for key=%s: %v", key, err)
+		}
+		return []byte(v), nil
+	}
+	return nil, groupcache.ErrNotFound
+}
+
+func createGroup(strategy string, shards uint, enableFilter bool, filterSize int, filterHashes int, filterRefresh time.Duration, redisAddr string, backend string, cacheBytes int64, evictionLog bool) *groupcache.Group {
+	backend = normalizeBackend(backend)
+	rdb := newRedisClient(redisAddr, backend)
+	opts := createGroupOptions(strategy, shards, enableFilter, filterSize, filterHashes, filterRefresh, backend, evictionLog, rdb)
+	return groupcache.NewGroup("scores", cacheBytes, newGroupGetter(rdb, backend), opts...)
 }
 
 func startCacheServer(addr string, addrs []string, gcache *groupcache.Group) {

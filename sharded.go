@@ -2,6 +2,7 @@ package cache
 
 import "time"
 
+// ShardedCache distributes cache operations across multiple local caches.
 type ShardedCache struct {
 	seed uint32
 	m    uint32

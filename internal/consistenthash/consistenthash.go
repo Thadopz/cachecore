@@ -6,8 +6,10 @@ import (
 	"strconv"
 )
 
+// Hash maps bytes to a 32-bit hash.
 type Hash func(data []byte) uint32
 
+// Map stores a consistent hash ring.
 type Map struct {
 	hash     Hash
 	replicas int
@@ -15,6 +17,7 @@ type Map struct {
 	hashMap  map[int]string
 }
 
+// New creates a consistent hash ring.
 func New(replicas int, fn Hash) *Map {
 	m := &Map{
 		replicas: replicas,
@@ -27,6 +30,7 @@ func New(replicas int, fn Hash) *Map {
 	return m
 }
 
+// Add inserts keys into the hash ring.
 func (m *Map) Add(keys ...string) {
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
@@ -38,6 +42,7 @@ func (m *Map) Add(keys ...string) {
 	sort.Ints(m.keys)
 }
 
+// Remove deletes keys from the hash ring.
 func (m *Map) Remove(keys ...string) {
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
@@ -52,6 +57,8 @@ func (m *Map) Remove(keys ...string) {
 		}
 	}
 }
+
+// Get returns the nearest ring member for key.
 func (m *Map) Get(key string) string {
 	if len(m.keys) == 0 {
 		return ""

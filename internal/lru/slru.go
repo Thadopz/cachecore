@@ -21,6 +21,7 @@ type slruEntry struct {
 	seg      segment
 }
 
+// SLRUCache is a segmented LRU cache.
 type SLRUCache struct {
 	maxBytes       int64
 	curbytes       int64
@@ -33,6 +34,7 @@ type SLRUCache struct {
 	onEvicted      func(key string, value Value)
 }
 
+// NewSLRU creates a segmented LRU cache.
 func NewSLRU(maxBytes int64, protectedRatio float64, onEvicted func(string, Value)) *SLRUCache {
 	if protectedRatio <= 0 || protectedRatio >= 1 {
 		protectedRatio = defaultProtectedRatio
@@ -47,6 +49,7 @@ func NewSLRU(maxBytes int64, protectedRatio float64, onEvicted func(string, Valu
 	}
 }
 
+// Get returns the cached value for key.
 func (c *SLRUCache) Get(key string) (value Value, ok bool) {
 	if ele, ok := c.cache[key]; ok {
 		kv := ele.Value.(*slruEntry)
@@ -66,6 +69,7 @@ func (c *SLRUCache) Get(key string) (value Value, ok bool) {
 	return nil, false
 }
 
+// RemoveOldest removes the oldest entry from the probation or protected segment.
 func (c *SLRUCache) RemoveOldest() {
 	if ele := c.probation.Back(); ele != nil {
 		c.removeElement(ele, true)
@@ -76,10 +80,12 @@ func (c *SLRUCache) RemoveOldest() {
 	}
 }
 
+// Add stores value without expiration.
 func (c *SLRUCache) Add(key string, value Value) {
 	c.AddWithTTL(key, value, 0)
 }
 
+// AddWithTTL stores value with an optional TTL.
 func (c *SLRUCache) AddWithTTL(key string, value Value, ttl time.Duration) {
 	expireAt := time.Time{}
 	if ttl > 0 {
@@ -119,12 +125,14 @@ func (c *SLRUCache) AddWithTTL(key string, value Value, ttl time.Duration) {
 	c.enforceTotalLimit()
 }
 
+// Remove deletes key from the cache.
 func (c *SLRUCache) Remove(key string) {
 	if ele, ok := c.cache[key]; ok {
 		c.removeElement(ele, true)
 	}
 }
 
+// RemoveExpired removes expired entries.
 func (c *SLRUCache) RemoveExpired() {
 	now := time.Now()
 	for ele := c.probation.Back(); ele != nil; {
@@ -145,6 +153,7 @@ func (c *SLRUCache) RemoveExpired() {
 	}
 }
 
+// Len returns the number of cache entries.
 func (c *SLRUCache) Len() int {
 	return len(c.cache)
 }

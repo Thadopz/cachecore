@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// Cache is a size-limited LRU cache.
 type Cache struct {
 	maxBytes  int64
 	curbytes  int64
@@ -13,6 +14,7 @@ type Cache struct {
 	onEvicted func(key string, value Value)
 }
 
+// Value is a cache value with a byte size.
 type Value interface {
 	Len() int
 }
@@ -23,6 +25,7 @@ type entry struct {
 	expireAt time.Time
 }
 
+// New creates an LRU cache.
 func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
 	return &Cache{
 		maxBytes:  maxBytes,
@@ -32,6 +35,7 @@ func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
 	}
 }
 
+// Get returns the cached value for key.
 func (c *Cache) Get(key string) (value Value, ok bool) {
 	if ele, ok := c.cache[key]; ok {
 		kv := ele.Value.(*entry)
@@ -47,6 +51,7 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 	return
 }
 
+// RemoveOldest removes the least recently used item.
 func (c *Cache) RemoveOldest() {
 	ele := c.ll.Back()
 	if ele != nil {
@@ -60,10 +65,12 @@ func (c *Cache) RemoveOldest() {
 	}
 }
 
+// Add stores value without expiration.
 func (c *Cache) Add(key string, value Value) {
 	c.AddWithTTL(key, value, 0)
 }
 
+// AddWithTTL stores value with an optional TTL.
 func (c *Cache) AddWithTTL(key string, value Value, ttl time.Duration) {
 	if ele, ok := c.cache[key]; ok {
 		c.ll.MoveToFront(ele)
@@ -89,6 +96,7 @@ func (c *Cache) AddWithTTL(key string, value Value, ttl time.Duration) {
 	}
 }
 
+// Remove deletes key from the cache.
 func (c *Cache) Remove(key string) {
 	if ele, ok := c.cache[key]; ok {
 		c.ll.Remove(ele)
@@ -101,6 +109,7 @@ func (c *Cache) Remove(key string) {
 	}
 }
 
+// RemoveExpired removes expired entries.
 func (c *Cache) RemoveExpired() {
 	for ele := c.ll.Back(); ele != nil; {
 		prev := ele.Prev()
@@ -112,6 +121,7 @@ func (c *Cache) RemoveExpired() {
 	}
 }
 
+// Len returns the number of cache entries.
 func (c *Cache) Len() int {
 	return c.ll.Len()
 }
