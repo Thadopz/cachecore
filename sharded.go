@@ -16,10 +16,15 @@ func djb33(seed uint32, k string) uint32 {
 	return d ^ (d >> 16)
 }
 
-func newShardedCache(seed uint32, m uint32, cacheBytes int64, onEvicted onEvictedFunc) *ShardedCache {
+func newShardedCache(seed uint32, m uint32, cacheBytes int64, onEvicted onEvictedFunc, useSLRU bool, slruProtectedRatio float64) *ShardedCache {
 	cs := make([]*cache, m)
 	for i := range cs {
-		cs[i] = &cache{cacheBytes: cacheBytes, onEvicted: onEvicted}
+		cs[i] = &cache{
+			cacheBytes:         cacheBytes,
+			onEvicted:          onEvicted,
+			useSLRU:            useSLRU,
+			slruProtectedRatio: slruProtectedRatio,
+		}
 	}
 	return &ShardedCache{
 		seed: seed,

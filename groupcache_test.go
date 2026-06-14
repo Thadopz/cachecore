@@ -69,6 +69,58 @@ func TestGroupGetCachesHotKey(t *testing.T) {
 	}
 }
 
+func TestGroupWithSLRUCachesHotKey(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-cache-hot-key-slru", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("value:" + key), nil
+	}), WithSLRU(0.8))
+
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if _, err := g.Get(context.Background(), "Tom"); err != nil {
+		t.Fatalf("second get failed: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("SLRU group should cache hot key: got getter calls %d, want 1", got)
+	}
+}
+
+func TestGroupWithShardedSLRUExpiresAndInvalidates(t *testing.T) {
+	var calls int32
+	g := NewGroup("test-cache-sharded-slru", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+		n := atomic.AddInt32(&calls, 1)
+		return []byte(fmt.Sprintf("value-%d", n)), nil
+	}), WithShardedCache(4), WithSLRU(0.8), WithRandomTTL(20*time.Millisecond, 0))
+
+	v, err := g.Get(context.Background(), "Tom")
+	if err != nil {
+		t.Fatalf("first get failed: %v", err)
+	}
+	if got := v.String(); got != "value-1" {
+		t.Fatalf("first value = %q, want value-1", got)
+	}
+
+	time.Sleep(35 * time.Millisecond)
+	v, err = g.Get(context.Background(), "Tom")
+	if err != nil {
+		t.Fatalf("get after ttl failed: %v", err)
+	}
+	if got := v.String(); got != "value-2" {
+		t.Fatalf("value after ttl = %q, want value-2", got)
+	}
+
+	g.Invalidate("Tom")
+	v, err = g.Get(context.Background(), "Tom")
+	if err != nil {
+		t.Fatalf("get after invalidate failed: %v", err)
+	}
+	if got := v.String(); got != "value-3" {
+		t.Fatalf("value after invalidate = %q, want value-3", got)
+	}
+}
+
 func TestGroupIncrementWithIncrementerUpdatesCache(t *testing.T) {
 	var counter int64 = 40
 	g := NewGroup("test-increment-backend", 1<<20, GetterFunc(func(ctx context.Context, key string) ([]byte, error) {

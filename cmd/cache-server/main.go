@@ -80,24 +80,47 @@ func defaultWarmupKeys() []string {
 	return keys
 }
 
-func createGroup(strategy string, shards uint, enableFilter bool, filterSize int, filterHashes int, filterRefresh time.Duration, redisAddr string) *groupcache.Group {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		log.Printf("[Redis] ping failed, fallback to db only: %v", err)
+func syntheticValue(key string) ([]byte, bool) {
+	if v, ok := db[key]; ok {
+		return []byte(v), true
+	}
+	if strings.HasPrefix(key, "key") && len(key) > len("key") {
+		raw := strings.TrimPrefix(key, "key")
+		if _, err := strconv.Atoi(raw); err == nil {
+			return []byte(raw), true
+		}
+	}
+	return nil, false
+}
+
+func createGroup(strategy string, shards uint, enableFilter bool, filterSize int, filterHashes int, filterRefresh time.Duration, redisAddr string, backend string, cacheBytes int64, evictionLog bool) *groupcache.Group {
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	if backend == "" {
+		backend = "demo"
 	}
 
-	opts := []groupcache.Option{
-		groupcache.WithOnEvicted(func(key string, value groupcache.ByteView) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	if backend != "synthetic" {
+		if err := rdb.Ping(context.Background()).Err(); err != nil {
+			log.Printf("[Redis] ping failed, fallback to db only: %v", err)
+		}
+	}
+
+	opts := []groupcache.Option{}
+	if evictionLog {
+		opts = append(opts, groupcache.WithOnEvicted(func(key string, value groupcache.ByteView) {
 			log.Printf("[Cache] evicted key=%s", key)
-		}),
-		groupcache.WithIncrementer(groupcache.IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
+		}))
+	}
+	if backend != "synthetic" {
+		opts = append(opts, groupcache.WithIncrementer(groupcache.IncrementerFunc(func(ctx context.Context, key string, delta int64) (int64, error) {
 			if ctx == nil {
 				ctx = context.Background()
 			}
 			redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
 			return rdb.IncrBy(redisCtx, key, delta).Result()
-		})),
+		})))
 	}
 	if enableFilter {
 		opts = append(opts, groupcache.WithFilter(bloomfilter.New(filterSize, filterHashes)))
@@ -111,14 +134,27 @@ func createGroup(strategy string, shards uint, enableFilter bool, filterSize int
 		opts = append(opts, groupcache.WithShardedCache(uint32(shards)))
 	case "unsharded":
 		// unsharded requires no extra option.
+	case "slru":
+		opts = append(opts, groupcache.WithSLRU(0.8))
+	case "sharded-slru":
+		opts = append(opts, groupcache.WithShardedCache(uint32(shards)), groupcache.WithSLRU(0.8))
 	default:
-		log.Fatalf("invalid cache strategy %q: use sharded or unsharded", strategy)
+		log.Fatalf("invalid cache strategy %q: use sharded, unsharded, slru, or sharded-slru", strategy)
 	}
 
-	g := groupcache.NewGroup("scores", 2<<10, groupcache.GetterFunc(
+	g := groupcache.NewGroup("scores", cacheBytes, groupcache.GetterFunc(
 		func(ctx context.Context, key string) ([]byte, error) {
 			if ctx == nil {
 				ctx = context.Background()
+			}
+			if backend == "synthetic" {
+				if value, ok := syntheticValue(key); ok {
+					return value, nil
+				}
+				return nil, groupcache.ErrNotFound
+			}
+			if backend != "demo" {
+				return nil, groupcache.ErrNotFound
 			}
 			redisCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
@@ -323,14 +359,20 @@ func main() {
 	var peersCSV string
 	var redisAddr string
 	var apiAddr string
+	var backend string
+	var cacheBytes int64
+	var evictionLog bool
 	flag.IntVar(&port, "port", 8001, "Cache server port")
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.StringVar(&apiAddr, "api-addr", "0.0.0.0:9999", "API server listen address")
 	flag.StringVar(&selfAddr, "self-addr", "", "Current node HTTP address for peer routing, e.g. http://cache-0.cache:8001")
 	flag.StringVar(&peersCSV, "peers", "", "Comma-separated peer HTTP addresses; defaults to local demo addresses when empty")
 	flag.StringVar(&redisAddr, "redis-addr", "127.0.0.1:6379", "Redis address host:port")
-	flag.StringVar(&strategy, "strategy", "sharded", "Cache strategy: sharded | unsharded")
+	flag.StringVar(&strategy, "strategy", "sharded", "Cache strategy: sharded | unsharded | slru | sharded-slru")
 	flag.UintVar(&shards, "shards", 256, "Shard count when using sharded strategy")
+	flag.Int64Var(&cacheBytes, "cache-bytes", 2<<10, "Cache capacity in bytes")
+	flag.StringVar(&backend, "backend", "demo", "Backend mode: demo | synthetic")
+	flag.BoolVar(&evictionLog, "eviction-log", true, "Log cache eviction callbacks")
 	flag.IntVar(&mutexProfileFraction, "mutex-profile-fraction", 0, "runtime.SetMutexProfileFraction value; >0 enables mutex contention sampling")
 	flag.IntVar(&blockProfileRate, "block-profile-rate", 0, "runtime.SetBlockProfileRate value; >0 enables blocking event sampling")
 	flag.Float64Var(&latencySampleRate, "latency-sample-rate", 1.0, "Latency percentile sampling rate: 1=all, 0.01=1%, 0=disable percentile sampling")
@@ -376,14 +418,16 @@ func main() {
 		addrs = append(addrs, selfAddr)
 	}
 
-	seedRedisNumericKeys(redisAddr)
+	if strings.ToLower(strings.TrimSpace(backend)) != "synthetic" {
+		seedRedisNumericKeys(redisAddr)
+	}
 
-	requestGroup := createGroup(strategy, shards, enableFilter, filterSize, filterHashes, filterRefresh, redisAddr)
+	requestGroup := createGroup(strategy, shards, enableFilter, filterSize, filterHashes, filterRefresh, redisAddr, backend, cacheBytes, evictionLog)
 	warmupKeys := splitCSV(warmupKeysCSV)
 	if enableFilter && len(warmupKeys) == 0 {
 		warmupKeys = defaultWarmupKeys()
 	}
-	log.Printf("[Config] strategy=%s shards=%d filter=%v filter_size=%d filter_hashes=%d filter_refresh=%s warmup_keys=%d mutex_profile_fraction=%d block_profile_rate=%d latency_sample_rate=%.4f", strategy, shards, enableFilter, filterSize, filterHashes, filterRefresh, len(warmupKeys), mutexProfileFraction, blockProfileRate, latencySampleRate)
+	log.Printf("[Config] strategy=%s shards=%d backend=%s cache_bytes=%d eviction_log=%v filter=%v filter_size=%d filter_hashes=%d filter_refresh=%s warmup_keys=%d mutex_profile_fraction=%d block_profile_rate=%d latency_sample_rate=%.4f", strategy, shards, backend, cacheBytes, evictionLog, enableFilter, filterSize, filterHashes, filterRefresh, len(warmupKeys), mutexProfileFraction, blockProfileRate, latencySampleRate)
 	if enableFilter {
 		requestGroup.Warmup(warmupKeys)
 	}

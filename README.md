@@ -3,10 +3,10 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 `cachecore` is a Go distributed cache library and demo server inspired by
-groupcache. It provides local LRU caching, peer-to-peer value loading over HTTP,
-singleflight request coalescing, optional Bloom filter pre-checks, negative
-caching, TTL jitter, stale-while-revalidate fallback, and lightweight runtime
-metrics.
+groupcache. It provides local LRU or SLRU caching, peer-to-peer value loading
+over HTTP, singleflight request coalescing, optional Bloom filter pre-checks,
+negative caching, TTL jitter, stale-while-revalidate fallback, and lightweight
+runtime metrics.
 
 The public Go package is:
 
@@ -16,10 +16,11 @@ import cache "github.com/Thadopz/cachecore"
 
 ## Features
 
-- In-memory LRU cache with byte-size limits, TTL expiration, and eviction callbacks.
+- In-memory LRU or SLRU cache with byte-size limits, TTL expiration, and eviction callbacks.
 - Distributed peer routing with consistent hashing and protobuf-over-HTTP transport.
 - Singleflight load coalescing for concurrent misses on the same key.
 - Optional sharded cache mode for lower lock contention under parallel workloads.
+- Optional SLRU policy through `WithSLRU`, useful when repeated hot keys should survive cold-key scans.
 - Optional Bloom filter gate through `WithFilter` and the public `bloomfilter` package.
 - Negative caching for `ErrNotFound`.
 - Optional stale-while-revalidate fallback when waiting for an in-flight load times out.
@@ -35,7 +36,7 @@ import cache "github.com/Thadopz/cachecore"
 |-- deployments/k8s/         # Kubernetes manifests
 |-- internal/consistenthash/ # Internal peer hash ring
 |-- internal/groupcachepb/   # Internal protobuf transport types
-|-- internal/lru/            # Internal LRU cache
+|-- internal/lru/            # Internal LRU and SLRU cache policies
 |-- internal/singleflight/   # Internal request coalescing
 |-- perf/                    # Benchmark, k6, pprof, and wrk helpers
 `-- *.go                     # Public cache package
@@ -64,6 +65,7 @@ func main() {
 			return nil, cache.ErrNotFound
 		}),
 		cache.WithShardedCache(256),
+		cache.WithSLRU(0.8),
 		cache.WithRandomTTL(5*time.Minute, 30*time.Second),
 		cache.WithNegativeCache(10*time.Second),
 	)
@@ -130,8 +132,11 @@ Useful flags:
 | `-self-addr` | `http://localhost:<port>` | Current node address used by peer routing. |
 | `-peers` | local `8001,8002,8003` demo peers | Comma-separated peer addresses. |
 | `-redis-addr` | `127.0.0.1:6379` | Redis backend address. |
-| `-strategy` | `sharded` | Cache strategy: `sharded` or `unsharded`. |
+| `-strategy` | `sharded` | Cache strategy: `sharded`, `unsharded`, `slru`, or `sharded-slru`. |
 | `-shards` | `256` | Shard count for sharded mode. |
+| `-cache-bytes` | `2048` | Cache capacity in bytes. |
+| `-backend` | `demo` | Backend mode: `demo` uses Redis plus built-in fallback data; `synthetic` skips Redis and returns deterministic benchmark keys. |
+| `-eviction-log` | `true` | Log cache eviction callbacks. Disable during high-churn benchmarks to avoid log I/O dominating tail latency. |
 | `-filter` | `false` | Enable Bloom filter pre-checks. |
 | `-filter-size` | `1000` | Bloom filter bitset size. |
 | `-filter-hashes` | `6` | Bloom filter hash count. |
@@ -168,6 +173,7 @@ go test ./... -run '^$' -bench . -benchmem
 go test ./internal/lru -run '^$' -bench . -benchmem
 go test ./internal/singleflight -run '^$' -bench . -benchmem
 ./perf/run-k6.ps1 -Mode mixed -VUs 120 -Duration 60s
+wsl -e sh -lc 'cd /mnt/e/goCache && WRK_DURATION=20s CACHE_BYTES=65536 WRK_SHARDS=256 HOT_KEYS=64 HOT_REPEATS=16 SLRU_SCAN_BURST=128 ./perf/compare-slru-wrk.sh'
 ```
 
 ## Development

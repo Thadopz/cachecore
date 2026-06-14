@@ -63,7 +63,9 @@ type Options struct {
 	onEvicted            func(key string, value ByteView)
 	cache                Cache
 	useShards            bool
+	useSLRU              bool
 	shards               uint32
+	slruProtectedRatio   float64
 	cacheTTL             time.Duration
 	ttlJitter            time.Duration
 	staleTTL             time.Duration
@@ -115,6 +117,13 @@ func WithShardedCache(shards uint32) Option {
 	return func(o *Options) {
 		o.useShards = true
 		o.shards = shards
+	}
+}
+
+func WithSLRU(protectedRatio float64) Option {
+	return func(o *Options) {
+		o.useSLRU = true
+		o.slruProtectedRatio = protectedRatio
 	}
 }
 
@@ -179,9 +188,14 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 			if perShardBytes <= 0 {
 				perShardBytes = 1
 			}
-			mainCache = newShardedCache(0, shards, perShardBytes, options.onEvicted)
+			mainCache = newShardedCache(0, shards, perShardBytes, options.onEvicted, options.useSLRU, options.slruProtectedRatio)
 		} else {
-			mainCache = &cache{cacheBytes: cacheBytes, onEvicted: options.onEvicted}
+			mainCache = &cache{
+				cacheBytes:         cacheBytes,
+				onEvicted:          options.onEvicted,
+				useSLRU:            options.useSLRU,
+				slruProtectedRatio: options.slruProtectedRatio,
+			}
 		}
 	}
 
@@ -214,9 +228,13 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...Option) *Gro
 			if perShardBytes <= 0 {
 				perShardBytes = 1
 			}
-			g.staleCache = newShardedCache(0, shards, perShardBytes, nil)
+			g.staleCache = newShardedCache(0, shards, perShardBytes, nil, options.useSLRU, options.slruProtectedRatio)
 		} else {
-			g.staleCache = &cache{cacheBytes: cacheBytes}
+			g.staleCache = &cache{
+				cacheBytes:         cacheBytes,
+				useSLRU:            options.useSLRU,
+				slruProtectedRatio: options.slruProtectedRatio,
+			}
 		}
 	}
 	if g.janitor != nil {

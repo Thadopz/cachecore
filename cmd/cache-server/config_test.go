@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"reflect"
 	"testing"
 )
@@ -38,5 +39,20 @@ func TestDefaultWarmupKeys(t *testing.T) {
 	}
 	if got[len(got)-1] != "key100" {
 		t.Fatalf("defaultWarmupKeys should include seeded numeric keys, got last=%q", got[len(got)-1])
+	}
+}
+
+func TestCreateGroupSupportsSLRUStrategiesWithSyntheticBackend(t *testing.T) {
+	for _, strategy := range []string{"unsharded", "sharded", "slru", "sharded-slru"} {
+		t.Run(strategy, func(t *testing.T) {
+			g := createGroup(strategy, 4, false, 0, 0, 0, "127.0.0.1:0", "synthetic", 1<<20, false)
+			view, err := g.Get(context.Background(), "key123")
+			if err != nil {
+				t.Fatalf("get failed: %v", err)
+			}
+			if got, want := view.String(), "123"; got != want {
+				t.Fatalf("synthetic value = %q, want %q", got, want)
+			}
+		})
 	}
 }
